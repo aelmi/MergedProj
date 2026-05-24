@@ -1,0 +1,1127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SQL Server Index Maintenance — v1.3 Review</title>
+<style>
+:root {
+  --bg: #FAFAF7;
+  --surface: #FFFFFF;
+  --text: #2C2C2A;
+  --text-muted: #5F5E5A;
+  --text-faint: #888780;
+  --border: #D3D1C7;
+  --border-strong: #B4B2A9;
+  --accent: #185FA5;
+
+  --amber-50: #FAEEDA;
+  --amber-200: #EF9F27;
+  --amber-600: #BA7517;
+  --amber-900: #412402;
+
+  --teal-50: #E1F5EE;
+  --teal-200: #5DCAA5;
+  --teal-600: #0F6E56;
+  --teal-900: #04342C;
+
+  --purple-50: #EEEDFE;
+  --purple-200: #AFA9EC;
+  --purple-600: #534AB7;
+  --purple-900: #26215C;
+
+  --blue-50: #E6F1FB;
+  --blue-200: #85B7EB;
+  --blue-600: #185FA5;
+  --blue-900: #042C53;
+
+  --gray-50: #F1EFE8;
+  --gray-200: #B4B2A9;
+  --gray-600: #5F5E5A;
+  --gray-900: #2C2C2A;
+
+  --shadow: 0 1px 2px rgba(0,0,0,.04), 0 4px 12px rgba(0,0,0,.04);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1B1B1A;
+    --surface: #252523;
+    --text: #E5E3DC;
+    --text-muted: #B4B2A9;
+    --text-faint: #888780;
+    --border: #3D3C39;
+    --border-strong: #5F5E5A;
+    --accent: #85B7EB;
+
+    --amber-50: #633806;
+    --amber-200: #FAC775;
+    --amber-600: #FAC775;
+    --amber-900: #FAEEDA;
+
+    --teal-50: #085041;
+    --teal-200: #5DCAA5;
+    --teal-600: #5DCAA5;
+    --teal-900: #E1F5EE;
+
+    --purple-50: #3C3489;
+    --purple-200: #AFA9EC;
+    --purple-600: #AFA9EC;
+    --purple-900: #EEEDFE;
+
+    --blue-50: #0C447C;
+    --blue-200: #85B7EB;
+    --blue-600: #85B7EB;
+    --blue-900: #E6F1FB;
+
+    --gray-50: #2C2C2A;
+    --gray-200: #888780;
+    --gray-600: #B4B2A9;
+    --gray-900: #E5E3DC;
+
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 4px 12px rgba(0,0,0,.2);
+  }
+}
+
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-size: 15px;
+  line-height: 1.6;
+}
+
+.container {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 32px 24px 64px;
+}
+
+header.page {
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 20px;
+  margin-bottom: 28px;
+}
+
+header.page .eyebrow {
+  font-size: 13px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  margin-bottom: 6px;
+}
+
+header.page h1 {
+  font-size: 28px;
+  font-weight: 500;
+  margin: 0 0 4px;
+  line-height: 1.2;
+}
+
+header.page .subtitle {
+  color: var(--text-muted);
+  margin: 0;
+  font-size: 16px;
+}
+
+header.page .meta {
+  margin-top: 14px;
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+header.page .meta span strong {
+  color: var(--text);
+  font-weight: 500;
+}
+
+/* Tabs */
+nav.tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 28px;
+  overflow-x: auto;
+}
+
+nav.tabs button {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 12px 18px;
+  font-size: 14px;
+  font-family: inherit;
+  font-weight: 500;
+  color: var(--text-muted);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color .15s, border-color .15s;
+  margin-bottom: -1px;
+}
+
+nav.tabs button:hover {
+  color: var(--text);
+}
+
+nav.tabs button.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+section.tab {
+  display: none;
+}
+
+section.tab.active {
+  display: block;
+}
+
+/* Sections inside tabs */
+section.tab > h2 {
+  font-size: 22px;
+  font-weight: 500;
+  margin: 36px 0 8px;
+}
+
+section.tab > h2:first-child {
+  margin-top: 0;
+}
+
+section.tab > .lead {
+  color: var(--text-muted);
+  margin: 0 0 24px;
+  font-size: 16px;
+  max-width: 70ch;
+}
+
+section.tab > h3 {
+  font-size: 17px;
+  font-weight: 500;
+  margin: 28px 0 8px;
+}
+
+section.tab p {
+  max-width: 75ch;
+  margin: 0 0 14px;
+}
+
+/* TL;DR card */
+.tldr {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  padding: 18px 22px;
+  margin-bottom: 32px;
+  box-shadow: var(--shadow);
+}
+
+.tldr .label {
+  display: inline-block;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  font-weight: 600;
+  color: var(--accent);
+  margin-bottom: 6px;
+}
+
+.tldr p {
+  margin: 0;
+  font-size: 16px;
+  line-height: 1.55;
+}
+
+/* Diagram wrapper */
+.diagram {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px 24px;
+  margin: 16px 0 28px;
+  box-shadow: var(--shadow);
+}
+
+/* Plain-english row explanations */
+.explanations {
+  display: grid;
+  grid-template-columns: 180px 1fr;
+  gap: 12px 24px;
+  margin: 0 0 32px;
+}
+
+.explanations .row-label {
+  font-weight: 500;
+  color: var(--text);
+  padding-top: 2px;
+}
+
+.explanations .row-text {
+  color: var(--text-muted);
+}
+
+@media (max-width: 600px) {
+  .explanations { grid-template-columns: 1fr; gap: 4px 0; }
+  .explanations .row-text { margin-bottom: 14px; }
+}
+
+/* Talking points */
+.talking-points {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px 24px;
+  margin: 16px 0 32px;
+  box-shadow: var(--shadow);
+}
+
+.talking-points dt {
+  font-weight: 500;
+  margin-top: 18px;
+  color: var(--text);
+  font-size: 15px;
+}
+
+.talking-points dt::before {
+  content: "Q: ";
+  color: var(--accent);
+}
+
+.talking-points dd {
+  margin: 6px 0 18px;
+  color: var(--text-muted);
+  font-size: 15px;
+  line-height: 1.55;
+}
+
+/* Defect cards */
+.defect {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px 24px;
+  margin: 0 0 20px;
+  box-shadow: var(--shadow);
+}
+
+.defect h3 {
+  margin: 0 0 4px;
+  font-size: 17px;
+  font-weight: 500;
+}
+
+.defect .defect-meta {
+  font-size: 12px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  margin-bottom: 14px;
+}
+
+.defect .block {
+  margin: 14px 0 0;
+}
+
+.defect .block-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  font-weight: 600;
+  margin-bottom: 4px;
+  display: inline-block;
+}
+
+.defect .plain-english .block-label { color: var(--teal-600); }
+.defect .technical .block-label { color: var(--purple-600); }
+.defect .impact .block-label { color: var(--amber-600); }
+
+.defect .block p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 15px;
+  line-height: 1.6;
+}
+
+.defect .block code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  background: var(--gray-50);
+  padding: 1px 6px;
+  border-radius: 4px;
+  color: var(--text);
+}
+
+/* File list table */
+table.files {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 12px 0 28px;
+  font-size: 14px;
+}
+
+table.files thead {
+  background: var(--gray-50);
+}
+
+table.files th {
+  text-align: left;
+  padding: 10px 14px;
+  font-weight: 500;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+}
+
+table.files td {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+table.files td:first-child {
+  font-weight: 500;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+table.files code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+table.files .badge {
+  display: inline-block;
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+
+.badge.new      { background: var(--teal-50);   color: var(--teal-900); }
+.badge.modify   { background: var(--amber-50);  color: var(--amber-900); }
+.badge.update   { background: var(--blue-50);   color: var(--blue-900); }
+.badge.nochange { background: var(--gray-50);   color: var(--gray-900); }
+
+/* Deployment steps */
+ol.steps {
+  counter-reset: step;
+  list-style: none;
+  padding: 0;
+  margin: 0 0 28px;
+}
+
+ol.steps li {
+  counter-increment: step;
+  position: relative;
+  padding: 14px 18px 14px 56px;
+  margin: 0 0 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: var(--shadow);
+}
+
+ol.steps li::before {
+  content: counter(step);
+  position: absolute;
+  left: 14px;
+  top: 14px;
+  width: 28px;
+  height: 28px;
+  background: var(--accent);
+  color: white;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  font-size: 13px;
+}
+
+ol.steps li strong {
+  display: block;
+  margin-bottom: 4px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+ol.steps li span.detail {
+  color: var(--text-muted);
+  font-size: 14px;
+}
+
+/* Architecture: component description */
+.component-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 14px;
+  margin: 16px 0 28px;
+}
+
+.component {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 14px 16px;
+  box-shadow: var(--shadow);
+}
+
+.component h4 {
+  margin: 0 0 4px;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.component p {
+  margin: 0;
+  font-size: 13.5px;
+  color: var(--text-muted);
+  line-height: 1.55;
+}
+
+.component .tag {
+  display: inline-block;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  font-weight: 600;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 3px;
+  vertical-align: middle;
+}
+
+.tag.t-new      { background: var(--teal-50);   color: var(--teal-900); }
+.tag.t-modify   { background: var(--amber-50);  color: var(--amber-900); }
+.tag.t-existing { background: var(--gray-50);   color: var(--gray-900); }
+
+/* Risk / rollback callout */
+.callout {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--teal-600);
+  border-radius: 6px;
+  padding: 14px 20px;
+  margin: 18px 0;
+  font-size: 14.5px;
+  color: var(--text-muted);
+}
+
+.callout strong { color: var(--text); font-weight: 500; }
+
+/* SVG inside diagrams: shared classes */
+svg .label-title { font: 500 14px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+svg .label-sub   { font: 400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+svg .label-eyebrow { font: 400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; fill: var(--text-faint); }
+
+svg .box-amber rect  { fill: var(--amber-50);  stroke: var(--amber-600); }
+svg .box-amber text  { fill: var(--amber-900); }
+
+svg .box-teal rect   { fill: var(--teal-50);   stroke: var(--teal-600); }
+svg .box-teal text   { fill: var(--teal-900); }
+
+svg .box-purple rect { fill: var(--purple-50); stroke: var(--purple-600); }
+svg .box-purple text { fill: var(--purple-900); }
+
+svg .box-blue rect   { fill: var(--blue-50);   stroke: var(--blue-600); }
+svg .box-blue text   { fill: var(--blue-900); }
+
+svg .box-gray rect   { fill: var(--gray-50);   stroke: var(--gray-600); }
+svg .box-gray text   { fill: var(--gray-900); }
+
+svg .arr { stroke: var(--text-faint); stroke-width: 1.2; fill: none; }
+
+/* Print */
+@media print {
+  body { background: white; }
+  .container { max-width: none; padding: 0; }
+  nav.tabs { display: none; }
+  section.tab { display: block !important; page-break-before: always; }
+  section.tab:first-of-type { page-break-before: auto; }
+  .diagram, .talking-points, .defect, .component, ol.steps li { box-shadow: none; }
+  header.page h1 { font-size: 22px; }
+  section.tab > h2 { font-size: 18px; margin-top: 24px; }
+}
+</style>
+</head>
+<body>
+<div class="container">
+
+  <header class="page">
+    <div class="eyebrow">Architecture review</div>
+    <h1>SQL Server Index Maintenance — v1.3</h1>
+    <p class="subtitle">A configuration-driven redesign of weekly maintenance, plus a new daily safety-net job</p>
+    <div class="meta">
+      <span><strong>Status:</strong> Draft for management review</span>
+      <span><strong>Author:</strong> DBA Team</span>
+      <span><strong>Date:</strong> 20 May 2026</span>
+    </div>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button class="active" data-tab="overview" role="tab">Overview</button>
+    <button data-tab="defects" role="tab">The 4 defects, explained</button>
+    <button data-tab="architecture" role="tab">Architecture detail</button>
+    <button data-tab="deployment" role="tab">Deployment plan</button>
+  </nav>
+
+  <!-- ============================================================== -->
+  <!-- TAB 1: OVERVIEW                                                  -->
+  <!-- ============================================================== -->
+  <section class="tab active" id="overview">
+
+    <div class="tldr">
+      <span class="label">TL;DR</span>
+      <p>We are replacing the wrapper around our SQL Server index maintenance with a configuration-driven version, adding a daily statistics-refresh job, and fixing four silent defects that have been making weekly maintenance run for 2 to 5 days. The work engine itself — Ola Hallengren's industry-standard <code>IndexOptimize</code> procedure — is unchanged. The change is fully reversible.</p>
+    </div>
+
+    <h2>What changed</h2>
+    <p class="lead">Five concrete differences between today's setup and v1.3.</p>
+
+    <div class="diagram">
+      <svg width="100%" viewBox="0 0 680 420" role="img" xmlns="http://www.w3.org/2000/svg">
+        <title>Before and after comparison across five categories</title>
+        <desc>Weekly run time goes from 2 to 5 days to hours; four known defects all resolved; parameter changes move from code deploys to XML edits; weekday coverage goes from none to stats plus safety net; scalability goes from single-threaded to parallel-ready.</desc>
+
+        <text class="label-title" x="300" y="42" text-anchor="middle">Current state</text>
+        <text class="label-title" x="530" y="42" text-anchor="middle">After v1.3</text>
+
+        <g class="box-gray"><rect x="40" y="60" width="140" height="50" rx="8" stroke-width="0.5"/><text class="label-title" x="110" y="85" text-anchor="middle" dominant-baseline="central">Weekly run time</text></g>
+        <g class="box-amber"><rect x="200" y="60" width="200" height="50" rx="8" stroke-width="0.5"/><text class="label-title" x="300" y="85" text-anchor="middle" dominant-baseline="central">2 to 5 days</text></g>
+        <g class="box-teal"><rect x="420" y="60" width="220" height="50" rx="8" stroke-width="0.5"/><text class="label-title" x="530" y="85" text-anchor="middle" dominant-baseline="central">Hours, not days</text></g>
+
+        <g class="box-gray"><rect x="40" y="125" width="140" height="50" rx="8" stroke-width="0.5"/><text class="label-title" x="110" y="150" text-anchor="middle" dominant-baseline="central">Known issues</text></g>
+        <g class="box-amber"><rect x="200" y="125" width="200" height="50" rx="8" stroke-width="0.5"/><text class="label-title" x="300" y="150" text-anchor="middle" dominant-baseline="central">4 active defects</text></g>
+        <g class="box-teal"><rect x="420" y="125" width="220" height="50" rx="8" stroke-width="0.5"/><text class="label-title" x="530" y="150" text-anchor="middle" dominant-baseline="central">All resolved</text></g>
+
+        <g class="box-gray"><rect x="40" y="190" width="140" height="50" rx="8" stroke-width="0.5"/><text class="label-title" x="110" y="215" text-anchor="middle" dominant-baseline="central">Parameter changes</text></g>
+        <g class="box-amber"><rect x="200" y="190" width="200" height="50" rx="8" stroke-width="0.5"/><text class="label-title" x="300" y="215" text-anchor="middle" dominant-baseline="central">Code change required</text></g>
+        <g class="box-teal"><rect x="420" y="190" width="220" height="50" rx="8" stroke-width="0.5"/><text class="label-title" x="530" y="215" text-anchor="middle" dominant-baseline="central">Config file edit</text></g>
+
+        <g class="box-gray"><rect x="40" y="255" width="140" height="50" rx="8" stroke-width="0.5"/><text class="label-title" x="110" y="280" text-anchor="middle" dominant-baseline="central">Weekday coverage</text></g>
+        <g class="box-amber"><rect x="200" y="255" width="200" height="50" rx="8" stroke-width="0.5"/><text class="label-title" x="300" y="280" text-anchor="middle" dominant-baseline="central">Not covered</text></g>
+        <g class="box-teal"><rect x="420" y="255" width="220" height="50" rx="8" stroke-width="0.5"/><text class="label-title" x="530" y="280" text-anchor="middle" dominant-baseline="central">Stats + safety net</text></g>
+
+        <g class="box-gray"><rect x="40" y="320" width="140" height="50" rx="8" stroke-width="0.5"/><text class="label-title" x="110" y="345" text-anchor="middle" dominant-baseline="central">Scalability</text></g>
+        <g class="box-amber"><rect x="200" y="320" width="200" height="50" rx="8" stroke-width="0.5"/><text class="label-title" x="300" y="345" text-anchor="middle" dominant-baseline="central">Single-threaded</text></g>
+        <g class="box-teal"><rect x="420" y="320" width="220" height="50" rx="8" stroke-width="0.5"/><text class="label-title" x="530" y="345" text-anchor="middle" dominant-baseline="central">Parallel-ready</text></g>
+      </svg>
+    </div>
+
+    <h3>What each row means</h3>
+    <div class="explanations">
+      <div class="row-label">Weekly run time</div>
+      <div class="row-text">The job that keeps our databases healthy currently runs for 2 to 5 full days and overlaps with business hours. The new version is expected to complete in hours.</div>
+
+      <div class="row-label">Known issues</div>
+      <div class="row-text">Four silent bugs in the current wrapper script. They mean rebuilds are cancelled after 30 seconds, the wrong technique is sometimes used, and the underlying tool is prevented from running efficiently. The "4 defects" tab explains each one in plain English.</div>
+
+      <div class="row-label">Parameter changes</div>
+      <div class="row-text">Today, adjusting any maintenance setting means editing a PowerShell script and redeploying it across the fleet. With v1.3, settings live in a single XML file that anyone with config access can adjust without touching code.</div>
+
+      <div class="row-label">Weekday coverage</div>
+      <div class="row-text">Monday to Saturday currently has zero maintenance. The new daily job refreshes statistics every weeknight and rebuilds any index that has become severely fragmented, keeping the database performing well between weekends.</div>
+
+      <div class="row-label">Scalability</div>
+      <div class="row-text">The current setup processes one database at a time. The new architecture is designed so that adding more parallel workers — to use the full server — is a deployment-only change in a future release, with no script rewrite needed.</div>
+    </div>
+
+    <h2>How it works</h2>
+    <p class="lead">A four-step flow. Same engine as today; new plumbing around it.</p>
+
+    <div class="diagram">
+      <svg width="100%" viewBox="0 0 680 460" role="img" xmlns="http://www.w3.org/2000/svg">
+        <title>High-level four-step flow of the v1.3 maintenance architecture</title>
+        <desc>A scheduled SQL Agent job triggers the wrapper, which reads source-controlled XML configuration, then calls Ola Hallengren's IndexOptimize procedure, with every action audited in CommandLog.</desc>
+        <defs>
+          <marker id="arrow1" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker>
+        </defs>
+
+        <g class="box-blue">
+          <rect x="180" y="40" width="320" height="70" rx="8" stroke-width="0.5"/>
+          <text class="label-title" x="340" y="68" text-anchor="middle" dominant-baseline="central">1. Scheduled trigger</text>
+          <text class="label-sub"   x="340" y="92" text-anchor="middle" dominant-baseline="central">Weekly Sun 04:00 + Daily Mon-Sat 18:00</text>
+        </g>
+        <line x1="340" y1="110" x2="340" y2="150" class="arr" marker-end="url(#arrow1)"/>
+        <g class="box-teal">
+          <rect x="180" y="150" width="320" height="70" rx="8" stroke-width="0.5"/>
+          <text class="label-title" x="340" y="178" text-anchor="middle" dominant-baseline="central">2. Read XML configuration</text>
+          <text class="label-sub"   x="340" y="202" text-anchor="middle" dominant-baseline="central">Source-controlled, DSC-enforced on hosts</text>
+        </g>
+        <line x1="340" y1="220" x2="340" y2="260" class="arr" marker-end="url(#arrow1)"/>
+        <g class="box-purple">
+          <rect x="180" y="260" width="320" height="70" rx="8" stroke-width="0.5"/>
+          <text class="label-title" x="340" y="288" text-anchor="middle" dominant-baseline="central">3. Run IndexOptimize</text>
+          <text class="label-sub"   x="340" y="312" text-anchor="middle" dominant-baseline="central">Stats refresh + targeted index rebuild</text>
+        </g>
+        <line x1="340" y1="330" x2="340" y2="370" class="arr" marker-end="url(#arrow1)"/>
+        <g class="box-amber">
+          <rect x="180" y="370" width="320" height="70" rx="8" stroke-width="0.5"/>
+          <text class="label-title" x="340" y="398" text-anchor="middle" dominant-baseline="central">4. Audit and monitor</text>
+          <text class="label-sub"   x="340" y="422" text-anchor="middle" dominant-baseline="central">Every action logged in dbo.CommandLog</text>
+        </g>
+      </svg>
+    </div>
+
+    <p>The key thing to convey is that we are not building new technology — we are putting proper engineering discipline around well-established tooling. The work engine in step 3 is Ola Hallengren's <code>IndexOptimize</code>, which is the de facto industry standard for SQL Server maintenance and is in production at thousands of organisations. What this release adds is the missing scaffolding around it.</p>
+
+    <h2>Six concrete wins</h2>
+    <p class="lead">Three for risk reduction, three for operational efficiency.</p>
+
+    <div class="diagram">
+      <svg width="100%" viewBox="0 0 680 320" role="img" xmlns="http://www.w3.org/2000/svg">
+        <title>Six concrete benefits</title>
+        <desc>Top row covers risk reduction. Bottom row covers operational efficiency.</desc>
+
+        <text class="label-eyebrow" x="40" y="30">Risk reduction</text>
+
+        <g class="box-teal">
+          <rect x="40" y="44" width="200" height="100" rx="8" stroke-width="0.5"/>
+          <text class="label-title" x="140" y="76"  text-anchor="middle" dominant-baseline="central">Faster weekly</text>
+          <text class="label-sub"   x="140" y="102" text-anchor="middle" dominant-baseline="central">Days to hours</text>
+          <text class="label-sub"   x="140" y="122" text-anchor="middle" dominant-baseline="central">Less business impact</text>
+        </g>
+        <g class="box-teal">
+          <rect x="260" y="44" width="200" height="100" rx="8" stroke-width="0.5"/>
+          <text class="label-title" x="360" y="76"  text-anchor="middle" dominant-baseline="central">Zero defects</text>
+          <text class="label-sub"   x="360" y="102" text-anchor="middle" dominant-baseline="central">4 known issues fixed</text>
+          <text class="label-sub"   x="360" y="122" text-anchor="middle" dominant-baseline="central">Including the 30s timeout</text>
+        </g>
+        <g class="box-teal">
+          <rect x="480" y="44" width="160" height="100" rx="8" stroke-width="0.5"/>
+          <text class="label-title" x="560" y="76"  text-anchor="middle" dominant-baseline="central">Daily safety net</text>
+          <text class="label-sub"   x="560" y="102" text-anchor="middle" dominant-baseline="central">Stats kept fresh</text>
+          <text class="label-sub"   x="560" y="122" text-anchor="middle" dominant-baseline="central">Hot indexes caught</text>
+        </g>
+
+        <text class="label-eyebrow" x="40" y="180">Operational efficiency</text>
+
+        <g class="box-purple">
+          <rect x="40" y="194" width="200" height="100" rx="8" stroke-width="0.5"/>
+          <text class="label-title" x="140" y="226" text-anchor="middle" dominant-baseline="central">Config-driven</text>
+          <text class="label-sub"   x="140" y="252" text-anchor="middle" dominant-baseline="central">Tune via XML edit</text>
+          <text class="label-sub"   x="140" y="272" text-anchor="middle" dominant-baseline="central">No code redeploy</text>
+        </g>
+        <g class="box-purple">
+          <rect x="260" y="194" width="200" height="100" rx="8" stroke-width="0.5"/>
+          <text class="label-title" x="360" y="226" text-anchor="middle" dominant-baseline="central">Fleet-wide tuning</text>
+          <text class="label-sub"   x="360" y="252" text-anchor="middle" dominant-baseline="central">One config, all servers</text>
+          <text class="label-sub"   x="360" y="272" text-anchor="middle" dominant-baseline="central">Per-instance overrides</text>
+        </g>
+        <g class="box-purple">
+          <rect x="480" y="194" width="160" height="100" rx="8" stroke-width="0.5"/>
+          <text class="label-title" x="560" y="226" text-anchor="middle" dominant-baseline="central">Future-ready</text>
+          <text class="label-sub"   x="560" y="252" text-anchor="middle" dominant-baseline="central">Parallel-prepared</text>
+          <text class="label-sub"   x="560" y="272" text-anchor="middle" dominant-baseline="central">v1.4 needs no rewrite</text>
+        </g>
+      </svg>
+    </div>
+
+    <h2>Talking points</h2>
+    <p class="lead">Likely questions and one-paragraph answers.</p>
+
+    <dl class="talking-points">
+      <dt>What changed?</dt>
+      <dd>We replaced a one-off PowerShell wrapper with a config-driven version of the same workflow. The work engine is unchanged — it is the industry-standard Ola Hallengren stored procedure. What we fixed was the plumbing around it.</dd>
+
+      <dt>Why now?</dt>
+      <dd>The current weekly job has been taking 2 to 5 days, which means it overlaps with business hours and competes with users. We identified four specific defects in the existing wrapper, and a workflow pattern that prevents the proven parallelism features from being used.</dd>
+
+      <dt>What is the risk?</dt>
+      <dd>The full rollback path is in source control. If anything looks wrong on the first run, the new Daily job can be disabled in seconds and the Weekly job's command reverts to one line. The change is reversible at every step.</dd>
+
+      <dt>What is next?</dt>
+      <dd>Once this version is stable, version 1.4 adds true cross-database parallelism. That release requires no script or configuration change — only adding more SQL Agent jobs alongside the existing ones. The groundwork is already in this release.</dd>
+
+      <dt>Will this break anything?</dt>
+      <dd>The existing Weekly DBA Jobs schedule and step structure stay in place — only the step's command line gets one extra argument. The new Daily DBA Jobs is a brand-new job, isolated from everything else. We are smoke-testing on a single small database before letting either job fire on schedule.</dd>
+    </dl>
+
+  </section>
+
+  <!-- ============================================================== -->
+  <!-- TAB 2: THE 4 DEFECTS                                             -->
+  <!-- ============================================================== -->
+  <section class="tab" id="defects">
+
+    <h2>The four silent defects in the current wrapper</h2>
+    <p class="lead">Each one has been quietly causing problems. Together they explain most of why the weekly job runs for days instead of hours.</p>
+
+    <article class="defect">
+      <h3>Defect 1 — The 30-second timeout</h3>
+      <div class="defect-meta">Severity: high  •  Impact: most rebuilds silently cancelled</div>
+      <div class="block plain-english">
+        <span class="block-label">In plain English</span>
+        <p>When rebuilding a large index, the script gives up after 30 seconds. The database engine keeps working, but the script has already moved on, and treats the job as successful. Indexes that need an hour of rebuild work get left in a partially-fixed state every week, which is why fragmentation has been creeping up despite the weekly job running to completion.</p>
+      </div>
+      <div class="block impact">
+        <span class="block-label">Business impact</span>
+        <p>Large tables never get properly maintained. Query plans on those tables choose progressively worse strategies, which shows up as slow reports and slow application screens.</p>
+      </div>
+      <div class="block technical">
+        <span class="block-label">Technical root cause</span>
+        <p>The line <code>$MaintenanceCommand.CommandTimeout = $TimeOut</code> references a variable named <code>$TimeOut</code> that is never defined in the script (the parameter is called <code>$TimeLimit</code>). The undefined value resolves to zero in PowerShell, but the .NET <code>SqlCommand</code> object treats that as "use the default", which is 30 seconds. In v1.3 we set it explicitly to <code>0</code>, which means no client-side timeout — the database engine controls duration through its own time-limit parameter.</p>
+      </div>
+    </article>
+
+    <article class="defect">
+      <h3>Defect 2 — The wrong rebuild technique</h3>
+      <div class="defect-meta">Severity: high  •  Impact: hours wasted on operations that cannot finish</div>
+      <div class="block plain-english">
+        <span class="block-label">In plain English</span>
+        <p>SQL Server offers two main ways to fix a fragmented index: a "gentle" approach called REORG, and a "comprehensive" approach called REBUILD. The current script prefers REORG for moderately-fragmented indexes because it sounds safer. Unfortunately REORG is single-threaded and on a large, busy index it can run for eight hours without finishing — meanwhile REBUILD would have done the same work in 20 minutes. We have seen this happen in production.</p>
+      </div>
+      <div class="block impact">
+        <span class="block-label">Business impact</span>
+        <p>A single problematic large index can hold up the entire weekly maintenance window. It also cannot update statistics, so a separate statistics-update pass is required afterwards — doubling the work for no benefit.</p>
+      </div>
+      <div class="block technical">
+        <span class="block-label">Technical root cause</span>
+        <p>The variable <code>$FragmentationMedium</code> is hardcoded to <code>"INDEX_REORGANIZE,INDEX_REBUILD_ONLINE,INDEX_REBUILD_OFFLINE"</code>. IndexOptimize takes the first applicable action, so REORG always wins for the 5-to-30-percent fragmentation band. In v1.3, REORG is removed from both the Medium and High bands. Both now go straight to online or offline rebuild, which uses multiple CPUs, completes deterministically, and refreshes statistics as a side effect.</p>
+      </div>
+    </article>
+
+    <article class="defect">
+      <h3>Defect 3 — The empty-configuration bug</h3>
+      <div class="defect-meta">Severity: medium  •  Impact: latent — would surface on first XML-driven run</div>
+      <div class="block plain-english">
+        <span class="block-label">In plain English</span>
+        <p>When a configuration setting is intentionally left blank — meaning "use the default" — the current code passes a blank string to the database engine. The engine refuses to accept a blank string for these settings and fails the entire job. This was a latent bug that would have shown up immediately once we adopted XML-based configuration.</p>
+      </div>
+      <div class="block impact">
+        <span class="block-label">Business impact</span>
+        <p>Without this fix, the very first run of the new configuration system would have failed across the fleet. The fix makes the XML "blank means default" behaviour work the way an operator would expect.</p>
+      </div>
+      <div class="block technical">
+        <span class="block-label">Technical root cause</span>
+        <p>An empty XML <code>value=""</code> attribute is read into PowerShell as an empty string <code>""</code>. The .NET <code>SqlCommand.Parameters.AddWithValue</code> call then passes <code>""</code> to the stored procedure rather than <code>NULL</code>. Ola's validation logic parses the empty string into a single empty action token and raises a "value not supported" error. The v1.3 wrapper has a new helper called <code>Convert-XmlValue</code> that maps any whitespace-or-empty XML value to <code>System.DBNull.Value</code>, which the procedure receives as proper SQL <code>NULL</code> and treats as "apply the default".</p>
+      </div>
+    </article>
+
+    <article class="defect">
+      <h3>Defect 4 — The database-by-database loop</h3>
+      <div class="defect-meta">Severity: high  •  Impact: prevents efficient ordering and time-limit features</div>
+      <div class="block plain-english">
+        <span class="block-label">In plain English</span>
+        <p>The current script processes databases one at a time in a PowerShell loop. The tool we use — Ola Hallengren's <code>IndexOptimize</code> — has features for "work on the largest databases first" and "stop everything cleanly if we have been running for X hours", but those features only work when the script lets the tool see all the databases at once. By looping in PowerShell, we are preventing the tool from doing its job efficiently.</p>
+      </div>
+      <div class="block impact">
+        <span class="block-label">Business impact</span>
+        <p>If maintenance is running out of time, the current script keeps starting work on small databases at the end of the alphabetical list. The new approach starts with the largest databases first and stops cleanly if the time budget runs out — so the most important work always gets done.</p>
+      </div>
+      <div class="block technical">
+        <span class="block-label">Technical root cause</span>
+        <p>The original wrapper does <code>foreach ($db in $dbs) { IndexOptimize @Databases = $db }</code>. Each invocation sees only one database, so <code>@DatabaseOrder</code> and <code>@TimeLimit</code> are meaningless. In v1.3, a single call passes <code>@Databases = 'USER_DATABASES, -ExcludedDB1, -ExcludedDB2'</code>. The procedure enumerates databases internally, applies ordering, propagates the time limit across the run, and natively skips non-primary Availability Group replicas.</p>
+      </div>
+    </article>
+
+    <div class="callout">
+      <strong>Net effect.</strong> All four defects are silent — none of them cause the job to report failure. They produce slow, incomplete maintenance and tie up the maintenance window. Fixing them is the single largest contributor to the expected reduction from days to hours.
+    </div>
+
+  </section>
+
+  <!-- ============================================================== -->
+  <!-- TAB 3: ARCHITECTURE                                              -->
+  <!-- ============================================================== -->
+  <section class="tab" id="architecture">
+
+    <h2>Architecture in detail</h2>
+    <p class="lead">Seven layers from the SQL Agent trigger down to the audit log.</p>
+
+    <div class="diagram">
+      <svg width="100%" viewBox="0 0 680 760" role="img" xmlns="http://www.w3.org/2000/svg">
+        <title>Detailed architecture of v1.3 maintenance</title>
+        <desc>Two SQL Agent jobs (Weekly and Daily) invoke a PowerShell wrapper that reads XML configuration and exclusions, computes MaxDOP from CPU detection, then calls Ola Hallengren's IndexOptimize stored procedure. The procedure logs to CommandLog and uses Queue tables for forward compatibility.</desc>
+        <defs>
+          <marker id="arrow2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker>
+        </defs>
+
+        <text class="label-eyebrow" x="40" y="30">1. Triggers</text>
+        <g class="box-blue"><rect x="40"  y="44" width="280" height="56" rx="8" stroke-width="0.5"/><text class="label-title" x="180" y="66" text-anchor="middle" dominant-baseline="central">Weekly DBA Jobs</text><text class="label-sub" x="180" y="84" text-anchor="middle" dominant-baseline="central">Sunday 04:00 — existing job</text></g>
+        <g class="box-blue"><rect x="360" y="44" width="280" height="56" rx="8" stroke-width="0.5"/><text class="label-title" x="500" y="66" text-anchor="middle" dominant-baseline="central">Daily DBA Jobs</text><text class="label-sub" x="500" y="84" text-anchor="middle" dominant-baseline="central">Mon-Sat 18:00 — new job</text></g>
+        <line x1="180" y1="100" x2="180" y2="140" class="arr" marker-end="url(#arrow2)"/>
+        <line x1="500" y1="100" x2="500" y2="140" class="arr" marker-end="url(#arrow2)"/>
+
+        <text class="label-eyebrow" x="40" y="160">2. Job step 1 (CmdExec)</text>
+        <g class="box-gray"><rect x="40"  y="174" width="280" height="40" rx="8" stroke-width="0.5"/><text class="label-sub" x="180" y="194" text-anchor="middle" dominant-baseline="central">PowerShell.exe -JobType Weekly</text></g>
+        <g class="box-gray"><rect x="360" y="174" width="280" height="40" rx="8" stroke-width="0.5"/><text class="label-sub" x="500" y="194" text-anchor="middle" dominant-baseline="central">PowerShell.exe -JobType Daily</text></g>
+        <line x1="180" y1="214" x2="280" y2="252" class="arr" marker-end="url(#arrow2)"/>
+        <line x1="500" y1="214" x2="400" y2="252" class="arr" marker-end="url(#arrow2)"/>
+
+        <text class="label-eyebrow" x="40" y="240">3. PowerShell wrapper</text>
+        <g class="box-purple"><rect x="180" y="252" width="320" height="60" rx="8" stroke-width="0.5"/><text class="label-title" x="340" y="274" text-anchor="middle" dominant-baseline="central">InstanceUpdateStats.ps1 (v1.3)</text><text class="label-sub" x="340" y="294" text-anchor="middle" dominant-baseline="central">Reads config, builds parameters</text></g>
+
+        <text class="label-eyebrow" x="40" y="340">4. Configuration sources</text>
+        <g class="box-teal"><rect x="40"  y="356" width="180" height="60" rx="8" stroke-width="0.5"/><text class="label-title" x="130" y="378" text-anchor="middle" dominant-baseline="central">IndexOptimizeConfig.xml</text><text class="label-sub" x="130" y="396" text-anchor="middle" dominant-baseline="central">Defaults + overrides</text></g>
+        <g class="box-teal"><rect x="250" y="356" width="180" height="60" rx="8" stroke-width="0.5"/><text class="label-title" x="340" y="378" text-anchor="middle" dominant-baseline="central">SQLExclusions.xml</text><text class="label-sub" x="340" y="396" text-anchor="middle" dominant-baseline="central">Excluded databases</text></g>
+        <g class="box-teal"><rect x="460" y="356" width="180" height="60" rx="8" stroke-width="0.5"/><text class="label-title" x="550" y="378" text-anchor="middle" dominant-baseline="central">sys.dm_os_sys_info</text><text class="label-sub" x="550" y="396" text-anchor="middle" dominant-baseline="central">CPU count for MaxDOP</text></g>
+        <line x1="130" y1="356" x2="280" y2="316" class="arr" marker-end="url(#arrow2)"/>
+        <line x1="340" y1="356" x2="340" y2="316" class="arr" marker-end="url(#arrow2)"/>
+        <line x1="550" y1="356" x2="400" y2="316" class="arr" marker-end="url(#arrow2)"/>
+        <line x1="340" y1="312" x2="340" y2="456" class="arr" marker-end="url(#arrow2)"/>
+
+        <text class="label-eyebrow" x="40" y="450">5. Stored procedure</text>
+        <g class="box-amber"><rect x="180" y="464" width="320" height="60" rx="8" stroke-width="0.5"/><text class="label-title" x="340" y="486" text-anchor="middle" dominant-baseline="central">dbo.IndexOptimize</text><text class="label-sub" x="340" y="506" text-anchor="middle" dominant-baseline="central">Ola Hallengren — 2026-05-15</text></g>
+        <line x1="340" y1="524" x2="180" y2="572" class="arr" marker-end="url(#arrow2)"/>
+        <line x1="340" y1="524" x2="500" y2="572" class="arr" marker-end="url(#arrow2)"/>
+        <line x1="340" y1="524" x2="340" y2="572" class="arr" marker-end="url(#arrow2)"/>
+
+        <text class="label-eyebrow" x="40" y="560">6. Logs and queue</text>
+        <g class="box-gray"><rect x="40"  y="576" width="180" height="60" rx="8" stroke-width="0.5"/><text class="label-title" x="130" y="598" text-anchor="middle" dominant-baseline="central">dbo.CommandLog</text><text class="label-sub" x="130" y="616" text-anchor="middle" dominant-baseline="central">One row per command</text></g>
+        <g class="box-gray"><rect x="250" y="576" width="180" height="60" rx="8" stroke-width="0.5"/><text class="label-title" x="340" y="598" text-anchor="middle" dominant-baseline="central">log file per PID</text><text class="label-sub" x="340" y="616" text-anchor="middle" dominant-baseline="central">S:\SQLMaintenance\log\</text></g>
+        <g class="box-gray"><rect x="460" y="576" width="180" height="60" rx="8" stroke-width="0.5"/><text class="label-title" x="550" y="598" text-anchor="middle" dominant-baseline="central">Queue, QueueDatabase</text><text class="label-sub" x="550" y="616" text-anchor="middle" dominant-baseline="central">Reserved for v1.4</text></g>
+        <line x1="340" y1="636" x2="340" y2="676" class="arr" marker-end="url(#arrow2)"/>
+
+        <text class="label-eyebrow" x="40" y="660">7. Job step 2</text>
+        <g class="box-purple"><rect x="180" y="676" width="320" height="40" rx="8" stroke-width="0.5"/><text class="label-sub" x="340" y="696" text-anchor="middle" dominant-baseline="central">EXECUTE sp_cycle_errorlog (T-SQL)</text></g>
+      </svg>
+    </div>
+
+    <h3>Components</h3>
+    <div class="component-grid">
+      <div class="component">
+        <h4>Weekly DBA Jobs <span class="tag t-modify">modified</span></h4>
+        <p>Existing SQL Agent job. Only the Step 1 command changes — adds <code>-JobType Weekly</code>. Schedule (Sun 04:00) and Step 2 (Cycle Error Log) remain identical.</p>
+      </div>
+      <div class="component">
+        <h4>Daily DBA Jobs <span class="tag t-new">new</span></h4>
+        <p>New SQL Agent job. Two steps — maintenance via PowerShell and Cycle Error Log. Schedule Mon-Sat 18:00. Completely independent from the existing weekly job.</p>
+      </div>
+      <div class="component">
+        <h4>InstanceUpdateStats.ps1 <span class="tag t-modify">modified</span></h4>
+        <p>The PowerShell wrapper, rebuilt to v1.3. Reads XML configuration, computes MaxDOP from CPU detection, calls IndexOptimize once with the full database list, fixes all four defects.</p>
+      </div>
+      <div class="component">
+        <h4>IndexOptimizeConfig.xml <span class="tag t-new">new</span></h4>
+        <p>Fleet-wide configuration file. Two default profiles (Weekly, Daily) and an optional <code>InstanceOverrides</code> section for edition-licensed CPU caps or other per-instance exceptions.</p>
+      </div>
+      <div class="component">
+        <h4>XMLFunctions.ps1 <span class="tag t-modify">modified</span></h4>
+        <p>Existing helper library. Two existing functions unchanged. One new function (<code>fnReadIndexOptimizeParams</code>) appended that reads the new XML and merges defaults with overrides.</p>
+      </div>
+      <div class="component">
+        <h4>SQLExclusions.xml <span class="tag t-existing">unchanged</span></h4>
+        <p>Existing per-instance exclusion list. Reused as-is. The new wrapper translates the exclusions into the stored procedure's <code>-DatabaseName</code> syntax.</p>
+      </div>
+      <div class="component">
+        <h4>dbo.IndexOptimize <span class="tag t-existing">unchanged</span></h4>
+        <p>Ola Hallengren's stored procedure. The work engine. Same version in production today; no upgrade needed.</p>
+      </div>
+      <div class="component">
+        <h4>dbo.Queue, dbo.QueueDatabase <span class="tag t-new">new</span></h4>
+        <p>Two new tables in MaintenanceDB. Required when <code>@DatabasesInParallel = 'Y'</code> is set, even with a single consumer. Installed now for v1.4 forward compatibility.</p>
+      </div>
+      <div class="component">
+        <h4>dbo.CommandLog <span class="tag t-existing">unchanged</span></h4>
+        <p>Existing audit table. One row per index or statistics command. Already populated by the current wrapper; v1.3 keeps logging to it.</p>
+      </div>
+    </div>
+
+    <h3>Configuration model</h3>
+    <p>One XML file controls every parameter for both profiles, on every instance in the fleet:</p>
+
+    <div class="diagram">
+      <svg width="100%" viewBox="0 0 680 240" role="img" xmlns="http://www.w3.org/2000/svg">
+        <title>XML configuration model with Defaults and InstanceOverrides</title>
+        <desc>The Defaults block contains a Weekly and Daily profile. The InstanceOverrides block sparsely overrides individual parameters for specific instances.</desc>
+
+        <g class="box-teal">
+          <rect x="40" y="40" width="280" height="180" rx="8" stroke-width="0.5"/>
+          <text class="label-title" x="180" y="68" text-anchor="middle" dominant-baseline="central">Defaults</text>
+          <text class="label-sub"   x="180" y="92" text-anchor="middle" dominant-baseline="central">Applies to every instance</text>
+        </g>
+        <g class="box-teal">
+          <rect x="60" y="110" width="240" height="40" rx="6" stroke-width="0.5"/>
+          <text class="label-sub" x="180" y="130" text-anchor="middle" dominant-baseline="central">Job name="Weekly" — full maintenance</text>
+        </g>
+        <g class="box-teal">
+          <rect x="60" y="160" width="240" height="40" rx="6" stroke-width="0.5"/>
+          <text class="label-sub" x="180" y="180" text-anchor="middle" dominant-baseline="central">Job name="Daily" — stats + safety net</text>
+        </g>
+
+        <g class="box-purple">
+          <rect x="360" y="40" width="280" height="180" rx="8" stroke-width="0.5"/>
+          <text class="label-title" x="500" y="68" text-anchor="middle" dominant-baseline="central">InstanceOverrides</text>
+          <text class="label-sub"   x="500" y="92" text-anchor="middle" dominant-baseline="central">Sparse exceptions only</text>
+        </g>
+        <g class="box-purple">
+          <rect x="380" y="110" width="240" height="40" rx="6" stroke-width="0.5"/>
+          <text class="label-sub" x="500" y="130" text-anchor="middle" dominant-baseline="central">Instance name="MVPSQLCR004\..."</text>
+        </g>
+        <g class="box-purple">
+          <rect x="380" y="160" width="240" height="40" rx="6" stroke-width="0.5"/>
+          <text class="label-sub" x="500" y="180" text-anchor="middle" dominant-baseline="central">Only the parameters that differ</text>
+        </g>
+      </svg>
+    </div>
+
+    <h3>How parameters are resolved at run time</h3>
+    <ol>
+      <li>The wrapper looks up the <code>Defaults/Job</code> matching the current <code>-JobType</code> argument.</li>
+      <li>It loads every parameter into a hashtable.</li>
+      <li>If an <code>InstanceOverrides/Instance</code> block matches the current server name and contains a <code>Job</code> matching the current JobType, only the parameters listed in that override block are replaced in the hashtable.</li>
+      <li>The resulting hashtable is passed to <code>IndexOptimize</code> as ADO.NET parameters, with empty values converted to SQL NULL.</li>
+    </ol>
+
+  </section>
+
+  <!-- ============================================================== -->
+  <!-- TAB 4: DEPLOYMENT                                                -->
+  <!-- ============================================================== -->
+  <section class="tab" id="deployment">
+
+    <h2>Deployment plan</h2>
+    <p class="lead">Six files, eight steps per instance. Every step has a verification check and an explicit rollback path.</p>
+
+    <h3>Files in this release</h3>
+    <table class="files">
+      <thead>
+        <tr>
+          <th>Status</th>
+          <th>File</th>
+          <th>Purpose</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><span class="badge new">New</span></td>
+          <td><code>IndexOptimizeConfig.xml</code></td>
+          <td>Fleet-wide configuration with Weekly + Daily profiles</td>
+        </tr>
+        <tr>
+          <td><span class="badge modify">Modify</span></td>
+          <td><code>InstanceUpdateStats.ps1</code></td>
+          <td>Wrapper rewritten to v1.3. Original structure preserved, every change marked with v1.3 comment</td>
+        </tr>
+        <tr>
+          <td><span class="badge modify">Modify</span></td>
+          <td><code>XMLFunctions.ps1</code></td>
+          <td>One new function appended. Existing two functions unchanged</td>
+        </tr>
+        <tr>
+          <td><span class="badge nochange">No change</span></td>
+          <td><code>DBAFunctions.ps1</code></td>
+          <td>Pure loader; XMLFunctions already in load list</td>
+        </tr>
+        <tr>
+          <td><span class="badge new">New</span></td>
+          <td><code>00_Install_QueueTables.sql</code></td>
+          <td>Installs Queue and QueueDatabase tables in MaintenanceDB</td>
+        </tr>
+        <tr>
+          <td><span class="badge update">Update</span></td>
+          <td><code>01_Update_WeeklyDBAJobs_Step.sql</code></td>
+          <td>Idempotent script adding <code>-JobType Weekly</code> to the existing Step 1 command</td>
+        </tr>
+        <tr>
+          <td><span class="badge new">New</span></td>
+          <td><code>02_Create_DailyDBAJobs.sql</code></td>
+          <td>Creates the new Daily DBA Jobs SQL Agent job</td>
+        </tr>
+        <tr>
+          <td><span class="badge nochange">No change</span></td>
+          <td><code>SQLExclusions.xml</code></td>
+          <td>Per-instance exclusions, consumed as today</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Deployment sequence (per instance)</h3>
+    <ol class="steps">
+      <li>
+        <strong>Capture baseline</strong>
+        <span class="detail">Record current weekly duration from <code>dbo.CommandLog</code>. Median run time becomes the success metric.</span>
+      </li>
+      <li>
+        <strong>Install queue tables</strong>
+        <span class="detail">Run <code>00_Install_QueueTables.sql</code> against the MaintenanceDB. Verify all five required objects are present.</span>
+      </li>
+      <li>
+        <strong>Deploy file changes via source control</strong>
+        <span class="detail">Commit the three updated files. Push, review, merge. DSC distributes them to the host.</span>
+      </li>
+      <li>
+        <strong>Smoke test the wrapper</strong>
+        <span class="detail">Run the wrapper manually against one small test database. Confirm <code>Ok</code> return and new rows in <code>dbo.CommandLog</code>.</span>
+      </li>
+      <li>
+        <strong>Update the Weekly job's step command</strong>
+        <span class="detail">Run <code>01_Update_WeeklyDBAJobs_Step.sql</code>. Adds <code>-JobType Weekly</code> to the existing command line.</span>
+      </li>
+      <li>
+        <strong>Create the new Daily job</strong>
+        <span class="detail">Run <code>02_Create_DailyDBAJobs.sql</code>. The script refuses to recreate if the job already exists.</span>
+      </li>
+      <li>
+        <strong>Manual first run of Daily DBA Jobs</strong>
+        <span class="detail"><code>EXEC msdb.dbo.sp_start_job</code> against the new job. Confirm <code>run_status = 1</code> in <code>sysjobhistory</code> before letting the schedule fire on Monday.</span>
+      </li>
+      <li>
+        <strong>Monitor first scheduled runs</strong>
+        <span class="detail">Watch Monday 18:00 (first Daily on schedule) and the following Sunday 04:00 (first new-style Weekly). Compare duration against baseline from Step 1.</span>
+      </li>
+    </ol>
+
+    <h3>Rollback</h3>
+    <div class="callout">
+      <p style="margin:0 0 8px"><strong>Step 1:</strong> Disable the new Daily DBA Jobs (one line).</p>
+      <p style="margin:0 0 8px"><strong>Step 2:</strong> Revert the Weekly DBA Jobs Step 1 command to the original (one <code>sp_update_jobstep</code> call; the original command is documented in the rollback block of <code>01_Update_WeeklyDBAJobs_Step.sql</code>).</p>
+      <p style="margin:0 0 8px"><strong>Step 3:</strong> If a defect is found in the new files, revert the commit in source control. DSC restores the previous versions on the next consistency pass. <strong>Do not</strong> edit files directly on the host — DSC will overwrite any local change.</p>
+      <p style="margin:0"><strong>Step 4:</strong> Leave the new Queue tables in place. They are empty when not in use and have no operational cost.</p>
+    </div>
+
+    <h3>Why this is safe</h3>
+    <p>Every step is reversible in seconds. The existing Weekly job's structure is preserved — only its command line gets one extra argument, which can be removed with a single SQL call. The new Daily job is brand new and isolated from everything else, so disabling it has no side effects. The work engine — Ola Hallengren's stored procedure — is the same one already in production. The configuration files live in source control, with DSC enforcing the desired state on each host.</p>
+
+  </section>
+
+</div>
+
+<script>
+(function () {
+  var buttons = document.querySelectorAll('nav.tabs button');
+  var sections = document.querySelectorAll('section.tab');
+
+  function activate(tabId) {
+    buttons.forEach(function (b) {
+      b.classList.toggle('active', b.getAttribute('data-tab') === tabId);
+    });
+    sections.forEach(function (s) {
+      s.classList.toggle('active', s.id === tabId);
+    });
+    if (history.replaceState) {
+      history.replaceState(null, '', '#' + tabId);
+    }
+  }
+
+  buttons.forEach(function (b) {
+    b.addEventListener('click', function () {
+      activate(b.getAttribute('data-tab'));
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    });
+  });
+
+  // Honour URL hash on load
+  if (window.location.hash) {
+    var target = window.location.hash.replace('#', '');
+    if (document.getElementById(target)) {
+      activate(target);
+    }
+  }
+})();
+</script>
+
+</body>
+</html>
