@@ -1052,13 +1052,20 @@ public sealed class ExcelExportWriter : IExportWriter
             ws.Row(row).OutlineLevel = 2;
             row++;
 
-            ws.Cell(row, 1).Value = "        SQL";
-            ws.Cell(row, 2).Value = "Definition";
-            ws.Cell(row,11).Value = o.Definition;
-            ws.Range(row, 1, row, 11).Style.Alignment.WrapText = true;
-            ws.Row(row).OutlineLevel = 3;
-            ws.Row(row).Height = Math.Min(400, 20 * Math.Min(20, o.Definition.Count(ch => ch == '\n') + 1));
-            row++;
+            var defChunks = ChunkForCell(o.Definition).ToList();
+            for (var i = 0; i < defChunks.Count; i++)
+            {
+                if (i == 0)
+                {
+                    ws.Cell(row, 1).Value = "        SQL";
+                    ws.Cell(row, 2).Value = "Definition";
+                }
+                ws.Cell(row, 11).Value = defChunks[i];
+                ws.Cell(row, 11).Style.Alignment.WrapText = true;
+                ws.Row(row).OutlineLevel = 3;
+                ws.Row(row).Height = Math.Min(400, 20 * Math.Min(20, defChunks[i].Count(ch => ch == '\n') + 1));
+                row++;
+            }
         }
 
         return row;
@@ -1210,14 +1217,21 @@ public sealed class ExcelExportWriter : IExportWriter
                     row++;
                     if (!string.IsNullOrWhiteSpace(t.Sql))
                     {
-                        ws.Cell(row, 1).Value = "            SQL";
-                        ws.Cell(row, 2).Value = "T-SQL";
-                        ws.Cell(row, 3).Value = t.Sql;
-                        ws.Cell(row, 3).Style.Alignment.WrapText = true;
-                        ws.Cell(row, 3).Style.Font.FontName = "Consolas";
-                        ws.Row(row).Height = Math.Min(300, 18 * Math.Min(15, t.Sql.Count(ch => ch == '\n') + 1));
-                        ws.Row(row).OutlineLevel = 3;
-                        row++;
+                        var sqlChunks = ChunkForCell(t.Sql).ToList();
+                        for (var i = 0; i < sqlChunks.Count; i++)
+                        {
+                            if (i == 0)
+                            {
+                                ws.Cell(row, 1).Value = "            SQL";
+                                ws.Cell(row, 2).Value = "T-SQL";
+                            }
+                            ws.Cell(row, 3).Value = sqlChunks[i];
+                            ws.Cell(row, 3).Style.Alignment.WrapText = true;
+                            ws.Cell(row, 3).Style.Font.FontName = "Consolas";
+                            ws.Row(row).Height = Math.Min(300, 18 * Math.Min(15, sqlChunks[i].Count(ch => ch == '\n') + 1));
+                            ws.Row(row).OutlineLevel = 3;
+                            row++;
+                        }
                     }
                 }
             }
@@ -1595,14 +1609,21 @@ public sealed class ExcelExportWriter : IExportWriter
             var key = AnchorKey(n);
             if (!seen.Add(key)) continue;
             defAnchors[key] = $"Definitions!A{row}";
-            ws.Cell(row, 1).Value = n.ServerName;
-            ws.Cell(row, 2).Value = n.DatabaseName;
-            ws.Cell(row, 3).Value = n.Schema;
-            ws.Cell(row, 4).Value = n.Name;
-            ws.Cell(row, 5).Value = n.Type.ToString();
-            ws.Cell(row, 6).Value = n.Definition;
-            ws.Cell(row, 6).Style.Alignment.WrapText = true;
-            row++;
+            var chunks = ChunkForCell(n.Definition).ToList();
+            for (var i = 0; i < chunks.Count; i++)
+            {
+                if (i == 0)
+                {
+                    ws.Cell(row, 1).Value = n.ServerName;
+                    ws.Cell(row, 2).Value = n.DatabaseName;
+                    ws.Cell(row, 3).Value = n.Schema;
+                    ws.Cell(row, 4).Value = n.Name;
+                    ws.Cell(row, 5).Value = n.Type.ToString();
+                }
+                ws.Cell(row, 6).Value = chunks[i];
+                ws.Cell(row, 6).Style.Alignment.WrapText = true;
+                row++;
+            }
         }
         Format(ws, headers.Length);
         ws.Column(6).Width = 100;
@@ -1617,6 +1638,27 @@ public sealed class ExcelExportWriter : IExportWriter
         ws.SheetView.FreezeRows(1);
         ws.RangeUsed()?.SetAutoFilter();
         ws.Columns().AdjustToContents();
+    }
+
+    // Excel hard-limits a cell to 32,767 chars. Split long text into chunks
+    // that fit, breaking on the last newline within each window so SQL/XML
+    // stays readable across rows. Callers write each chunk on its own row.
+    private static IEnumerable<string> ChunkForCell(string text, int maxLen = 32_000)
+    {
+        var start = 0;
+        while (start < text.Length)
+        {
+            var remaining = text.Length - start;
+            if (remaining <= maxLen)
+            {
+                yield return text.Substring(start);
+                yield break;
+            }
+            var lastNl = text.LastIndexOf('\n', start + maxLen - 1, maxLen);
+            var len = (lastNl > start) ? (lastNl - start + 1) : maxLen;
+            yield return text.Substring(start, len);
+            start += len;
+        }
     }
 
     private static IEnumerable<DbObjectNode> Flatten(IEnumerable<DbObjectNode> nodes)
