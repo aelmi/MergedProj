@@ -687,8 +687,7 @@ namespace FileContentToolkit.Dialogs
             {
                 _plans[e.Index].Include = e.NewValue == CheckState.Checked;
             }
-            // BeginInvoke so the count reflects the new state after the check actually applies.
-            BeginInvoke(new Action(UpdateWriteHint));
+            UpdateWriteHint();
         }
 
         private void UpdateWriteHint()
@@ -5278,9 +5277,9 @@ namespace FileContentToolkit
             toolTip1.SetToolTip(btnBrowse, "Browse for a folder");
             btnBrowse.UseVisualStyleBackColor = false;
             btnBrowse.Click += BtnBrowse_Click;
-            //
+            // 
             // btnAddFolder
-            //
+            // 
             btnAddFolder.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             btnAddFolder.BackColor = Color.FromArgb(40, 167, 69);
             btnAddFolder.Cursor = Cursors.Hand;
@@ -5290,13 +5289,13 @@ namespace FileContentToolkit
             btnAddFolder.ForeColor = Color.White;
             btnAddFolder.Location = new Point(1280, 110);
             btnAddFolder.Name = "btnAddFolder";
-            btnAddFolder.Size = new Size(140, 34);
+            btnAddFolder.Size = new Size(140, 39);
             btnAddFolder.TabIndex = 11;
             btnAddFolder.Text = "+ Add Folder";
             toolTip1.SetToolTip(btnAddFolder, "Scan another folder for the configured extensions and append its files to the list");
             btnAddFolder.UseVisualStyleBackColor = false;
             btnAddFolder.Click += BtnAddFolder_Click;
-            //
+            // 
             // btnTree
             // 
             btnTree.BackColor = Color.FromArgb(51, 122, 183);
@@ -5307,7 +5306,7 @@ namespace FileContentToolkit
             btnTree.ForeColor = Color.White;
             btnTree.Location = new Point(20, 110);
             btnTree.Name = "btnTree";
-            btnTree.Size = new Size(90, 34);
+            btnTree.Size = new Size(90, 39);
             btnTree.TabIndex = 5;
             btnTree.Text = "Tree";
             toolTip1.SetToolTip(btnTree, "Pick files and folders from a tree view");
@@ -5324,7 +5323,7 @@ namespace FileContentToolkit
             btnRecentFolders.ForeColor = Color.White;
             btnRecentFolders.Location = new Point(116, 110);
             btnRecentFolders.Name = "btnRecentFolders";
-            btnRecentFolders.Size = new Size(110, 34);
+            btnRecentFolders.Size = new Size(110, 39);
             btnRecentFolders.TabIndex = 6;
             btnRecentFolders.Text = "Recent ▾";
             toolTip1.SetToolTip(btnRecentFolders, "Recently used folders");
@@ -5341,7 +5340,7 @@ namespace FileContentToolkit
             btnOptions.ForeColor = Color.White;
             btnOptions.Location = new Point(232, 110);
             btnOptions.Name = "btnOptions";
-            btnOptions.Size = new Size(110, 34);
+            btnOptions.Size = new Size(110, 39);
             btnOptions.TabIndex = 7;
             btnOptions.Text = "Options";
             toolTip1.SetToolTip(btnOptions, "Configure filters, encoding, watcher");
@@ -5358,7 +5357,7 @@ namespace FileContentToolkit
             btnSavePreset.ForeColor = Color.White;
             btnSavePreset.Location = new Point(348, 110);
             btnSavePreset.Name = "btnSavePreset";
-            btnSavePreset.Size = new Size(150, 34);
+            btnSavePreset.Size = new Size(150, 39);
             btnSavePreset.TabIndex = 8;
             btnSavePreset.Text = "Save preset";
             toolTip1.SetToolTip(btnSavePreset, "Save current folder + extensions as a preset");
@@ -5375,7 +5374,7 @@ namespace FileContentToolkit
             btnLoadPreset.ForeColor = Color.White;
             btnLoadPreset.Location = new Point(504, 110);
             btnLoadPreset.Name = "btnLoadPreset";
-            btnLoadPreset.Size = new Size(130, 34);
+            btnLoadPreset.Size = new Size(130, 39);
             btnLoadPreset.TabIndex = 9;
             btnLoadPreset.Text = "Presets ▾";
             toolTip1.SetToolTip(btnLoadPreset, "Load or manage saved presets");
@@ -5778,7 +5777,7 @@ namespace FileContentToolkit
             btnAdd.Location = new Point(270, 60);
             btnAdd.Name = "btnAdd";
             btnAdd.ShowSplit = true;
-            btnAdd.Size = new Size(133, 38);
+            btnAdd.Size = new Size(133, 43);
             btnAdd.TabIndex = 2;
             btnAdd.Text = "Add";
             btnAdd.UseVisualStyleBackColor = false;
@@ -5929,8 +5928,8 @@ namespace FileContentToolkit
             lstExtensions.ItemHeight = 28;
             lstExtensions.Location = new Point(10, 105);
             lstExtensions.Name = "lstExtensions";
-            lstExtensions.Size = new Size(249, 172);
             lstExtensions.SelectionMode = SelectionMode.MultiExtended;
+            lstExtensions.Size = new Size(249, 172);
             lstExtensions.TabIndex = 3;
             lstExtensions.KeyDown += LstExtensions_KeyDown;
             // 
@@ -5940,9 +5939,9 @@ namespace FileContentToolkit
             btnRemove.FlatStyle = FlatStyle.Flat;
             btnRemove.Font = new Font("Segoe UI", 9.5F, FontStyle.Bold);
             btnRemove.ForeColor = Color.White;
-            btnRemove.Location = new Point(270, 105);
+            btnRemove.Location = new Point(270, 115);
             btnRemove.Name = "btnRemove";
-            btnRemove.Size = new Size(133, 38);
+            btnRemove.Size = new Size(133, 43);
             btnRemove.TabIndex = 4;
             btnRemove.Text = "Remove";
             btnRemove.UseVisualStyleBackColor = false;
@@ -5967,9 +5966,9 @@ namespace FileContentToolkit
             btnRefreshExtensions.FlatStyle = FlatStyle.Flat;
             btnRefreshExtensions.Font = new Font("Segoe UI", 9.5F, FontStyle.Bold);
             btnRefreshExtensions.ForeColor = Color.White;
-            btnRefreshExtensions.Location = new Point(270, 150);
+            btnRefreshExtensions.Location = new Point(270, 169);
             btnRefreshExtensions.Name = "btnRefreshExtensions";
-            btnRefreshExtensions.Size = new Size(133, 38);
+            btnRefreshExtensions.Size = new Size(133, 43);
             btnRefreshExtensions.TabIndex = 6;
             btnRefreshExtensions.Text = "Refresh";
             btnRefreshExtensions.UseVisualStyleBackColor = false;
@@ -7397,7 +7396,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("FileContentToolkit")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+691220385b0f3500734b93227706a72436840ebe")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+f1fdfa2e238d73b6749394aca4d10c7a26125811")]
 [assembly: System.Reflection.AssemblyProductAttribute("FileContentToolkit")]
 [assembly: System.Reflection.AssemblyTitleAttribute("FileContentToolkit")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
