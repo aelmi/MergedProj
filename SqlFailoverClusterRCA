@@ -1,0 +1,2855 @@
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Data\eventid.map.json:
+{
+  "$comment": "Windows/SQL event-id → meaning lookup used by collectors/normalizer. Phase 0 seed; expand in Phase 1.",
+  "schemaVersion": 1,
+  "windows": {
+    "1001": "Bugcheck (system crash dump)",
+    "6008": "Unexpected shutdown",
+    "41":   "Kernel-Power: system rebooted without clean shutdown",
+    "129":  "Storage: reset to device issued (disk timeout)",
+    "153":  "Storage: I/O operation retried",
+    "1135": "FailoverClustering: cluster node removed from active membership",
+    "1146": "FailoverClustering: RHS process terminated",
+    "1069": "FailoverClustering: cluster resource failed",
+    "1177": "FailoverClustering: quorum lost, cluster service shutting down"
+  },
+  "sql": {
+    "833":   "I/O requests taking longer than 15s",
+    "1105":  "Filegroup full",
+    "9002":  "Transaction log full",
+    "17890": "Process paged out (memory pressure)",
+    "19407": "Availability replica lease is no longer valid",
+    "19421": "Availability group health check timeout"
+  }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Data\rules.catalog.json:
+{
+  "$comment": "Rule metadata: category/severity + human-facing remediation and KB links keyed by rule Id. The Match/Confidence logic lives in Private/Analyze/Rules/*.ps1; this file holds the copy so it can be edited without touching code. Every entry carries isPlanned so rule files can read it under Set-StrictMode.",
+  "schemaVersion": 2,
+  "rules": [
+    {
+      "id": "NODE-CRASH-BUGCHECK",
+      "category": "Node crash / bugcheck",
+      "severity": "Critical",
+      "isPlanned": false,
+      "kbRef": "https://learn.microsoft.com/windows-server/failover-clustering/troubleshooting-using-windows-error-reporting",
+      "remediation": "A node went down abruptly (bugcheck 1001 / Kernel-Power 41 / unexpected shutdown 6008). Analyze the crash dump (MEMORY.DMP) to identify the faulting driver/component; check power, firmware and storage stability on that node."
+    },
+    {
+      "id": "QUORUM-WITNESS-LOSS",
+      "category": "Quorum loss / witness",
+      "severity": "Critical",
+      "isPlanned": false,
+      "kbRef": "https://learn.microsoft.com/windows-server/failover-clustering/manage-cluster-quorum",
+      "remediation": "Verify witness availability and node votes; review dynamic quorum reweighting around the event. A lost quorum forces the cluster service down and takes the SQL role offline."
+    },
+    {
+      "id": "NET-HEARTBEAT-LOSS",
+      "category": "Network heartbeat",
+      "severity": "High",
+      "isPlanned": false,
+      "kbRef": "https://learn.microsoft.com/windows-server/failover-clustering/cluster-network-recommendations",
+      "remediation": "Check NIC health/flaps and SameSubnetThreshold/CrossSubnetThreshold vs observed missed heartbeats; inspect switch/firewall and any QoS/RSC offload on the cluster network."
+    },
+    {
+      "id": "AG-LEASE-TIMEOUT",
+      "category": "AG lease / health timeout",
+      "severity": "High",
+      "isPlanned": false,
+      "kbRef": "https://learn.microsoft.com/sql/database-engine/availability-groups/windows/availability-group-lease-healthcheck-timeout",
+      "remediation": "Review HealthCheckTimeout/LeaseTimeout and FailureConditionLevel; investigate why sp_server_diagnostics stalled (CPU starvation, dump, non-yielding scheduler) on the primary."
+    },
+    {
+      "id": "STORAGE-IO-STALL",
+      "category": "Storage / I/O",
+      "severity": "High",
+      "isPlanned": false,
+      "kbRef": "https://learn.microsoft.com/sql/relational-databases/errors-events/mssqlserver-833-database-engine-error",
+      "remediation": "Correlate SQL 833 I/O stalls with disk Event 129/153 and storage path latency; engage the storage team and check HBA/multipath/firmware."
+    },
+    {
+      "id": "RESOURCE-FAILURE",
+      "category": "Cluster resource / RHS failure",
+      "severity": "High",
+      "isPlanned": false,
+      "kbRef": "https://learn.microsoft.com/windows-server/failover-clustering/troubleshooting-cluster-resource-failures",
+      "remediation": "A clustered resource failed its health check or the RHS hosting process terminated (Event 1069/1146). Identify the failing resource/DLL, review its IsAlive/LooksAlive and pending timeouts, and isolate it to its own RHS if it is crashing the monitor."
+    },
+    {
+      "id": "PLANNED-MOVE",
+      "category": "Planned / administrative",
+      "severity": "Low",
+      "isPlanned": true,
+      "kbRef": "https://learn.microsoft.com/powershell/module/failoverclusters/move-clustergroup",
+      "remediation": "No fault. Failover was initiated administratively (Move-ClusterGroup / maintenance drain / graceful failover). Confirm it was expected and scheduled."
+    }
+  ]
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Invoke-Tests.ps1:
+<#
+    Convenience test runner. Requires Pester 5+ (Install-Module Pester -Scope CurrentUser).
+    Usage:  .\Invoke-Tests.ps1            # run unit tests
+            .\Invoke-Tests.ps1 -Detailed  # verbose output
+#>
+[CmdletBinding()]
+param([switch]$Detailed)
+
+Import-Module Pester -MinimumVersion 5.0 -Force
+
+$cfg = New-PesterConfiguration
+$cfg.Run.Path = Join-Path $PSScriptRoot 'Tests\Unit'
+$cfg.Output.Verbosity = if ($Detailed) { 'Detailed' } else { 'Normal' }
+Invoke-Pester -Configuration $cfg
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Analyze\Invoke-RuleEngine.ps1:
+<#
+    Rule engine - evaluates rule objects from Private/Analyze/Rules/ against the timeline
+    and returns ranked [Rca.RootCauseFinding] objects.
+
+    A rule is a hashtable: @{ Id; Category; Severity; Match={param($tl)..};
+    Confidence={param($matches,$tl)..}; Explain; Remediation; KbRef; IsPlanned }.
+
+    Phase 0: the Rules/ folder is empty, so this returns no findings - but the wiring,
+    ranking, and primary-narrative selection are real and unit-tested via injected rules.
+#>
+
+# Strict-safe optional-field reader: rules are hashtables (keys may be absent) or objects.
+function Get-RuleField {
+    param($Rule, [string]$Name, $Default = $null)
+    if ($Rule -is [hashtable]) {
+        if ($Rule.ContainsKey($Name)) { return $Rule[$Name] } else { return $Default }
+    }
+    $p = $Rule.PSObject.Properties[$Name]
+    if ($p) { return $p.Value } else { return $Default }
+}
+
+function Get-RcaRule {
+    [CmdletBinding()]
+    param([string]$RulesPath = (Join-Path $script:ModuleRoot 'Private\Analyze\Rules'))
+    if (-not (Test-Path $RulesPath)) { return @() }
+    Get-ChildItem -Path $RulesPath -Filter '*.ps1' -File | ForEach-Object {
+        # Each rule file returns one or more rule hashtables.
+        & $_.FullName
+    }
+}
+
+function Invoke-RuleEngine {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Timeline,
+
+        # Optional rule injection (used by tests); defaults to loading from Rules/.
+        [object[]]$Rule
+    )
+
+    if (-not $PSBoundParameters.ContainsKey('Rule')) { $Rule = @(Get-RcaRule) }
+
+    $findings = foreach ($r in $Rule) {
+        $ruleId = Get-RuleField $r 'Id' '(unnamed)'
+        try {
+            $matchBlock = Get-RuleField $r 'Match'
+            $matches = & $matchBlock $Timeline
+            if (-not $matches) { continue }
+            $conf = [int](& (Get-RuleField $r 'Confidence') $matches $Timeline)
+
+            # Human-facing metadata comes from Data\rules.catalog.json (looked up here, in
+            # module scope) so rule files only carry Id/Explain/Match/Confidence. A rule may
+            # still override any field inline - used by the injected test rules.
+            $meta = Get-RcaRuleMeta $ruleId
+
+            New-RootCauseFinding `
+                -RuleId $ruleId -Category (Get-RuleField $r 'Category' $meta.category) `
+                -Severity (Get-RuleField $r 'Severity' $meta.severity) -Confidence $conf `
+                -Explanation (Get-RuleField $r 'Explain') `
+                -Remediation (Get-RuleField $r 'Remediation' $meta.remediation) `
+                -KbRef (Get-RuleField $r 'KbRef' $meta.kbRef) `
+                -Evidence @($matches) -IsPlanned ([bool](Get-RuleField $r 'IsPlanned' $meta.isPlanned))
+        }
+        catch {
+            Write-RcaLog "Rule '$ruleId' threw: $($_.Exception.Message)" -Level Warn
+        }
+    }
+
+    # Rank by confidence desc, then severity weight desc.
+    $sevRank = @{ Critical = 4; High = 3; Medium = 2; Low = 1 }
+    @($findings) | Sort-Object `
+        @{ Expression = { $_.Confidence }; Descending = $true }, `
+        @{ Expression = { $sevRank[$_.Severity] }; Descending = $true }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Analyze\Rules\Rule-AgLease.ps1:
+<#  Rule: Always On lease / health-check timeout triggered the failover.  #>
+@{
+    Id         = 'AG-LEASE-TIMEOUT'
+    Explain    = 'The AG lease expired or the health check timed out (SQL 19407/19421, or ERRORLOG lease / sp_server_diagnostics entries). The resource DLL stopped getting a healthy response from the primary instance within LeaseTimeout/HealthCheckTimeout and failed the AG over.'
+    Match      = { param($tl)
+        @($tl | Where-Object {
+            ($_.EventId -in '19407', '19421') -or
+            (($_.Source -in 'SqlErrorLog', 'SqlHaDmv', 'ClusterLog') -and $_.Message -match '(?i)lease|health\s*check|sp_server_diagnostics')
+        })
+    }
+    Confidence = { param($m, $tl) Get-RcaConfidence -Base 58 -Corroborations (@($m).Count) }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Analyze\Rules\Rule-Network.ps1:
+<#  Rule: cluster network heartbeat loss caused the node to be evicted.  #>
+@{
+    Id         = 'NET-HEARTBEAT-LOSS'
+    Explain    = 'Missed cluster heartbeats / NetFT connectivity failures (cluster.log heartbeat or netft entries, or node removed from membership Event 1135) indicate the node was evicted because the cluster network went silent past the heartbeat thresholds - not because the node itself was unhealthy.'
+    Match      = { param($tl)
+        @($tl | Where-Object {
+            ($_.Source -eq 'WindowsEvent' -and $_.EventId -eq '1135') -or
+            ($_.Message -match '(?i)heartbeat|netft|missed.*(beat|connect)|lost connectivity')
+        })
+    }
+    Confidence = { param($m, $tl) Get-RcaConfidence -Base 55 -Corroborations (@($m).Count) }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Analyze\Rules\Rule-NodeCrash.ps1:
+<#  Rule: node went down abruptly (bugcheck / power loss / unexpected shutdown).
+    Metadata (category/severity/remediation/KB) is supplied by the engine from
+    Data\rules.catalog.json keyed on Id.  #>
+@{
+    Id         = 'NODE-CRASH-BUGCHECK'
+    Explain    = 'A node logged a bugcheck (1001), Kernel-Power 41, or unexpected shutdown (6008) inside the window - it went down abruptly rather than handing the role off cleanly, which forces an ungraceful failover.'
+    Match      = { param($tl) @($tl | Where-Object { $_.Source -eq 'WindowsEvent' -and ($_.EventId -in '41', '1001', '6008') }) }
+    Confidence = { param($m, $tl) Get-RcaConfidence -Base 72 -Corroborations (@($m).Count) }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Analyze\Rules\Rule-PlannedMove.ps1:
+<#  Rule: administrative / planned failover (no fault). Catalog marks it IsPlanned.  #>
+@{
+    Id         = 'PLANNED-MOVE'
+    Explain    = 'The failover looks administrative: cluster.log / events mention a Move-ClusterGroup, a maintenance drain, a graceful/planned move, or an administrator-initiated action - rather than a fault signal.'
+    Match      = { param($tl)
+        @($tl | Where-Object {
+            $_.Message -match '(?i)move.?clustergroup|drain(ing)?|maintenance|graceful|administrator initiated|planned failover|move the clustered'
+        })
+    }
+    # Kept modest so a genuine fault outranks it; corroboration nudges it up only slightly.
+    Confidence = { param($m, $tl) Get-RcaConfidence -Base 40 -Corroborations (@($m).Count) -Per 6 -Max 75 }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Analyze\Rules\Rule-Quorum.ps1:
+<#  Rule: quorum/witness loss took the cluster (and the SQL role) down.  #>
+@{
+    Id         = 'QUORUM-WITNESS-LOSS'
+    Explain    = 'Quorum was lost (Event 1177 / node removed 1135, cluster.log quorum-arbitration entries, or a non-normal quorum state in the HA DMVs). When the cluster cannot maintain quorum it shuts the cluster service down and the SQL role goes offline.'
+    Match      = { param($tl)
+        @($tl | Where-Object {
+            ($_.Source -eq 'WindowsEvent' -and ($_.EventId -in '1177', '1135')) -or
+            (($_.Source -in 'ClusterLog', 'WsfcState') -and $_.Message -match '(?i)quorum|arbitrat') -or
+            ($_.Source -eq 'SqlHaDmv' -and $_.Message -match '(?i)quorum' -and $_.Message -notmatch '(?i)normal')
+        })
+    }
+    Confidence = { param($m, $tl)
+        $hard = @($m | Where-Object { $_.EventId -eq '1177' }).Count
+        Get-RcaConfidence -Base 60 -Corroborations (@($m).Count + ($hard * 2))
+    }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Analyze\Rules\Rule-ResourceFailure.ps1:
+<#  Rule: a clustered resource / RHS process failure caused the move.  #>
+@{
+    Id         = 'RESOURCE-FAILURE'
+    Explain    = 'A clustered resource failed (Event 1069) or the Resource Hosting Subsystem terminated (Event 1146), or cluster.log shows an RHS/IsAlive failure. The group failed over because a resource in it could not stay online on the current owner.'
+    Match      = { param($tl)
+        @($tl | Where-Object {
+            ($_.Source -eq 'WindowsEvent' -and ($_.EventId -in '1069', '1146')) -or
+            (($_.Source -in 'ClusterLog', 'WsfcState') -and $_.Message -match '(?i)\bRHS\b|IsAlive|LooksAlive|resource.*fail')
+        })
+    }
+    Confidence = { param($m, $tl) Get-RcaConfidence -Base 54 -Corroborations (@($m).Count) }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Analyze\Rules\Rule-Storage.ps1:
+<#  Rule: storage / I-O stall starved the instance into a failover.  #>
+@{
+    Id         = 'STORAGE-IO-STALL'
+    Explain    = 'SQL reported I/O stalls (error 833 / "I/O requests taking longer than 15s") and/or Windows logged disk resets/retries (Event 129/153). Stalled storage makes sp_server_diagnostics and the lease appear unhealthy, which can drive an AG/FCI failover.'
+    Match      = { param($tl)
+        @($tl | Where-Object {
+            ($_.EventId -in '833', '129', '153') -or
+            ($_.Message -match '(?i)I/O requests taking longer|i/?o is frozen|stall|reset to device|operation retried')
+        })
+    }
+    Confidence = { param($m, $tl) Get-RcaConfidence -Base 52 -Corroborations (@($m).Count) }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Collectors\Get-ClusterLogData.ps1:
+<#
+    Collector 1/6 - WSFC cluster.log. Runs Get-ClusterLog per node inside its PSSession,
+    pre-filters to interesting lines (errors/warnings + quorum/heartbeat/RHS/move/lease
+    keywords), ships them back, and parses each into a timeline event scoped to the window.
+    cluster.log is generated with -UseLocalTime so timestamps line up with the event logs.
+#>
+
+function Get-ClusterLogData {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string[]]$Node,
+        [hashtable]$Session = @{},
+        [datetime]$WindowStart,
+        [datetime]$WindowEnd,
+        [pscredential]$Credential
+    )
+    $events = [System.Collections.Generic.List[object]]::new()
+    $status = [System.Collections.Generic.List[object]]::new()
+
+    # Get-ClusterLog -TimeSpan is "last N minutes"; cover from window start to now + buffer.
+    $spanMin = [int][math]::Ceiling(((Get-Date) - $WindowStart).TotalMinutes) + 15
+    if ($spanMin -lt 5)    { $spanMin = 5 }
+    if ($spanMin -gt 4320) { $spanMin = 4320 }   # cap at 3 days of log
+
+    $remote = {
+        param($spanMinutes)
+        $dir = Join-Path $env:TEMP ('rca_clog_' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        try {
+            Get-ClusterLog -Node $env:COMPUTERNAME -TimeSpan $spanMinutes -Destination $dir -UseLocalTime -ErrorAction Stop | Out-Null
+            $f = Get-ChildItem $dir -Filter '*.log' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if (-not $f) { return @() }
+            $rx = '(?i)(\bERR\b|\bWARN\b|quorum|heartbeat|netft|IsAlive|LooksAlive|\bRHS\b|moved|move\b|online|offline|failed|lease|evict|arbitrat)'
+            @(Get-Content $f.FullName | Where-Object { $_ -match $rx })
+        }
+        finally {
+            Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $tsRx = [regex]'(\d{4})/(\d{2})/(\d{2})-(\d{2}):(\d{2}):(\d{2})\.(\d{3})'
+
+    foreach ($n in $Node) {
+        $sess = $Session[$n]
+        if (-not $sess) {
+            $status.Add((New-CollectionStatus -Node $n -Source 'ClusterLog' -State 'Failed' -Detail 'No remote session (node unreachable).'))
+            continue
+        }
+        try {
+            $lines = @(Invoke-RcaRemote -Session $sess -ScriptBlock $remote -ArgumentList @($spanMin))
+            $kept = 0
+            foreach ($line in $lines) {
+                $m = $tsRx.Match($line)
+                if (-not $m.Success) { continue }
+                $ts = [datetime]::new([int]$m.Groups[1].Value, [int]$m.Groups[2].Value, [int]$m.Groups[3].Value,
+                                       [int]$m.Groups[4].Value, [int]$m.Groups[5].Value, [int]$m.Groups[6].Value,
+                                       [int]$m.Groups[7].Value)
+                if ($ts -lt $WindowStart -or $ts -gt $WindowEnd) { continue }
+                $sev = if ($line -match '(?i)\bERR\b') { 'Error' } elseif ($line -match '(?i)\bWARN\b') { 'Warning' } else { 'Info' }
+                $text = $line.Substring($m.Index + $m.Length).Trim()
+                $events.Add((New-TimelineEvent -Timestamp $ts -Node $n -Source 'ClusterLog' `
+                    -Severity $sev -Message (Get-RcaFirstLine $text 400) -Data @{ Raw = $line }))
+                $kept++
+            }
+            $state = if ($lines.Count -gt 0) { 'Ok' } else { 'Partial' }
+            $status.Add((New-CollectionStatus -Node $n -Source 'ClusterLog' -State $state -ItemCount $kept -Detail "$kept line(s) in window (of $($lines.Count) candidate(s))."))
+        }
+        catch {
+            $status.Add((New-CollectionStatus -Node $n -Source 'ClusterLog' -State 'Failed' -Detail $_.Exception.Message))
+        }
+    }
+
+    @{ Events = $events.ToArray(); Status = $status.ToArray() }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Collectors\Get-NodeHealthData.ps1:
+<#
+    Collector 6/6 - node health snapshot via CIM inside each node's PSSession: last boot
+    (a reboot inside the window is a prime failover cause), free physical memory, logical
+    disk free space, pending-reboot flag, and clock skew vs the analysis host. Emits a
+    timeline event only for notable conditions; always records a collection status.
+#>
+
+function Get-NodeHealthData {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string[]]$Node,
+        [hashtable]$Session = @{},
+        [datetime]$WindowStart,
+        [datetime]$WindowEnd,
+        [pscredential]$Credential
+    )
+    $events = [System.Collections.Generic.List[object]]::new()
+    $status = [System.Collections.Generic.List[object]]::new()
+
+    $remote = {
+        $os = Get-CimInstance Win32_OperatingSystem
+        $pending = [bool]((Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
+                          (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'))
+        $disks = Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {
+            $pct = if ($_.Size) { [math]::Round(100.0 * $_.FreeSpace / $_.Size, 1) } else { 0 }
+            [pscustomobject]@{ Drive = $_.DeviceID; FreePct = $pct; FreeGB = [math]::Round($_.FreeSpace / 1GB, 1) }
+        }
+        [pscustomobject]@{
+            LastBoot  = $os.LastBootUpTime
+            FreeMemMB = [math]::Round($os.FreePhysicalMemory / 1024)
+            Now       = (Get-Date)
+            Pending   = $pending
+            Disks     = $disks
+        }
+    }
+
+    foreach ($n in $Node) {
+        $sess = $Session[$n]
+        if (-not $sess) {
+            $status.Add((New-CollectionStatus -Node $n -Source 'NodeHealth' -State 'Failed' -Detail 'No remote session (node unreachable).'))
+            continue
+        }
+        try {
+            $h = Invoke-RcaRemote -Session $sess -ScriptBlock $remote
+            $count = 0
+
+            if ($h.LastBoot -and $h.LastBoot -ge $WindowStart -and $h.LastBoot -le $WindowEnd) {
+                $events.Add((New-TimelineEvent -Timestamp $h.LastBoot -Node $n -Source 'NodeHealth' -Severity 'Critical' `
+                    -Message "Node '$n' booted at $($h.LastBoot.ToString('yyyy-MM-dd HH:mm:ss')) - a reboot occurred inside the analysis window." `
+                    -Data @{ Kind = 'Reboot' })); $count++
+            }
+            $skew = [math]::Abs(((Get-Date) - $h.Now).TotalSeconds)
+            if ($skew -gt 30) {
+                $events.Add((New-TimelineEvent -Timestamp $WindowEnd -Node $n -Source 'NodeHealth' -Severity 'Warning' `
+                    -Message "Clock skew vs analysis host is ~$([math]::Round($skew))s - can break cluster/AG health checks." `
+                    -Data @{ Kind = 'ClockSkew'; SkewSeconds = $skew })); $count++
+            }
+            if ($h.FreeMemMB -lt 256) {
+                $events.Add((New-TimelineEvent -Timestamp $WindowEnd -Node $n -Source 'NodeHealth' -Severity 'Warning' `
+                    -Message "Low free physical memory: $($h.FreeMemMB) MB." -Data @{ Kind = 'Memory' })); $count++
+            }
+            foreach ($d in @($h.Disks)) {
+                if ($d.FreePct -lt 10) {
+                    $events.Add((New-TimelineEvent -Timestamp $WindowEnd -Node $n -Source 'NodeHealth' -Severity 'Warning' `
+                        -Message "Low disk space on $($d.Drive): $($d.FreePct)% ($($d.FreeGB) GB) free." -Data @{ Kind = 'Disk'; Drive = $d.Drive })); $count++
+                }
+            }
+            if ($h.Pending) {
+                $events.Add((New-TimelineEvent -Timestamp $WindowEnd -Node $n -Source 'NodeHealth' -Severity 'Info' `
+                    -Message "Node '$n' has a pending reboot." -Data @{ Kind = 'PendingReboot' })); $count++
+            }
+
+            $status.Add((New-CollectionStatus -Node $n -Source 'NodeHealth' -State 'Ok' -ItemCount $count -Detail "LastBoot=$($h.LastBoot); FreeMem=$($h.FreeMemMB)MB."))
+        }
+        catch {
+            $status.Add((New-CollectionStatus -Node $n -Source 'NodeHealth' -State 'Failed' -Detail $_.Exception.Message))
+        }
+    }
+
+    @{ Events = $events.ToArray(); Status = $status.ToArray() }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Collectors\Get-SqlErrorLogData.ps1:
+<#
+    Collector 4/6 - SQL Server ERRORLOG. Reads the active log via xp_readerrorlog (read-only,
+    allowed through the contract guard) bounded to the analysis window, on EACH replica
+    instance directly. AG role changes, lease/health-check timeouts, I/O stalls (833) and
+    other engine errors surface here with their original timestamps.
+#>
+
+function Get-SqlErrorLogData {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string[]]$Node,
+        [string[]]$SqlInstance,
+        [datetime]$WindowStart,
+        [datetime]$WindowEnd,
+        [pscredential]$Credential
+    )
+    $events = [System.Collections.Generic.List[object]]::new()
+    $status = [System.Collections.Generic.List[object]]::new()
+
+    # Each replica is queried directly; default to a default instance per node when not given.
+    $instances = if ($SqlInstance) { $SqlInstance } else { $Node }
+
+    $start = $WindowStart.ToString('yyyy-MM-dd HH:mm:ss.fff')
+    $end   = $WindowEnd.ToString('yyyy-MM-dd HH:mm:ss.fff')
+    $query = "EXEC sys.xp_readerrorlog 0, 1, NULL, NULL, '$start', '$end', N'ASC'"
+
+    # Error numbers / phrases that denote a genuine fault (vs informational lines).
+    $sevRx = '(?i)\b(error|fail|cannot|fatal|lease|timeout|stall|corrupt|severity:\s*1[6-9]|severity:\s*2[0-5])\b'
+    $numRx = [regex]'(?i)Error:\s*(\d+)'
+
+    foreach ($inst in $instances) {
+        try {
+            $rows = @(Invoke-SqlReadOnly -ServerInstance $inst -Query $query -Credential $Credential)
+            foreach ($r in $rows) {
+                $text = "$($r.Text)"
+                $sev = if ($text -match $sevRx) { 'Error' } else { 'Info' }
+                $eid = $null
+                $nm = $numRx.Match($text)
+                if ($nm.Success) {
+                    $eid = $nm.Groups[1].Value
+                    $meaning = Get-RcaSqlEventMeaning $eid
+                    if ($meaning -and $sev -eq 'Info') { $sev = 'Warning' }
+                    if ($meaning) { $text = "$meaning - $text" }
+                }
+                $events.Add((New-TimelineEvent -Timestamp ([datetime]$r.LogDate) -Node $inst -Source 'SqlErrorLog' `
+                    -Severity $sev -EventId $eid -Message (Get-RcaFirstLine $text 400) `
+                    -Data @{ ProcessInfo = "$($r.ProcessInfo)" }))
+            }
+            $status.Add((New-CollectionStatus -Node $inst -Source 'SqlErrorLog' -State 'Ok' -ItemCount $rows.Count -Detail "$($rows.Count) ERRORLOG line(s) in window."))
+        }
+        catch {
+            $status.Add((New-CollectionStatus -Node $inst -Source 'SqlErrorLog' -State 'Failed' -Detail $_.Exception.Message))
+        }
+    }
+
+    @{ Events = $events.ToArray(); Status = $status.ToArray() }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Collectors\Get-SqlHaDmvData.ps1:
+<#
+    Collector 5/6 - SQL HA DMVs (read-only). Queries EACH replica instance directly and
+    captures: per-replica role/health (sys.dm_hadr_availability_replica_states), per-database
+    synchronization state and queues (sys.dm_hadr_database_replica_states), cluster/quorum
+    (sys.dm_hadr_cluster), instance identity (SERVERPROPERTY), and FCI nodes/ownership
+    (sys.dm_os_cluster_nodes). Hitting every replica means the surviving secondary's view is
+    captured even when the former primary is down. All SELECTs flow through the read-only guard.
+#>
+
+function Get-SqlHaDmvData {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string[]]$Node,
+        [string[]]$SqlInstance,
+        [datetime]$WindowStart,
+        [datetime]$WindowEnd,
+        [pscredential]$Credential
+    )
+    $events = [System.Collections.Generic.List[object]]::new()
+    $status = [System.Collections.Generic.List[object]]::new()
+    $instances = if ($SqlInstance) { $SqlInstance } else { $Node }
+    $stamp = $WindowEnd
+
+    $qReplicas = @"
+SELECT ag.name AS ag_name, ar.replica_server_name, ars.role_desc, ars.operational_state_desc,
+       ars.connected_state_desc, ars.synchronization_health_desc, ars.recovery_health_desc
+FROM sys.availability_groups ag
+JOIN sys.availability_replicas ar ON ag.group_id = ar.group_id
+JOIN sys.dm_hadr_availability_replica_states ars ON ar.replica_id = ars.replica_id
+"@
+    $qDbs = @"
+SELECT ar.replica_server_name, DB_NAME(drs.database_id) AS db_name,
+       drs.synchronization_state_desc, drs.synchronization_health_desc, drs.is_suspended,
+       drs.last_commit_time, drs.log_send_queue_size, drs.redo_queue_size
+FROM sys.dm_hadr_database_replica_states drs
+JOIN sys.availability_replicas ar ON drs.replica_id = ar.replica_id
+"@
+    $qCluster  = "SELECT cluster_name, quorum_type_desc, quorum_state_desc FROM sys.dm_hadr_cluster"
+    $qIdentity = "SELECT CAST(SERVERPROPERTY('ServerName') AS sysname) AS server_name, " +
+                 "CAST(SERVERPROPERTY('IsClustered') AS int) AS is_clustered, " +
+                 "CAST(SERVERPROPERTY('IsHadrEnabled') AS int) AS is_hadr, " +
+                 "CAST(SERVERPROPERTY('ComputerNamePhysicalNetBIOS') AS sysname) AS physical_node"
+    $qFci = "SELECT NodeName, status_description, is_current_owner FROM sys.dm_os_cluster_nodes"
+
+    foreach ($inst in $instances) {
+        $count = 0
+        $errDetail = $null
+
+        # Probe with the first query: if even this cannot run, the instance is unreachable -
+        # record one Failed status and move on (no point trying the other four connections).
+        $rep = @()
+        try { $rep = @(Invoke-SqlReadOnly -ServerInstance $inst -Query $qReplicas -Credential $Credential) }
+        catch {
+            $status.Add((New-CollectionStatus -Node $inst -Source 'SqlHaDmv' -State 'Failed' -Detail $_.Exception.Message))
+            continue
+        }
+
+        # Connection works; gather the rest. Each query is isolated so one missing DMV
+        # (e.g. a non-FCI instance) does not lose the others.
+        $res = @{}
+        foreach ($qi in @(
+            @{ k = 'db'; q = $qDbs }, @{ k = 'clu'; q = $qCluster },
+            @{ k = 'idn'; q = $qIdentity }, @{ k = 'fci'; q = $qFci })) {
+            try { $res[$qi.k] = @(Invoke-SqlReadOnly -ServerInstance $inst -Query $qi.q -Credential $Credential) }
+            catch { $res[$qi.k] = @(); if (-not $errDetail) { $errDetail = $_.Exception.Message } }
+        }
+        $db = $res['db']; $clu = $res['clu']; $idn = $res['idn']; $fci = $res['fci']
+
+        # Field reads go through Get-RcaProp: DMV column sets differ across SQL versions, and
+        # under StrictMode a direct missing-property access would throw out of the collector.
+        try {
+            foreach ($r in $rep) {
+                $health = "$(Get-RcaProp $r 'synchronization_health_desc')"
+                $sev = if ($health -eq 'HEALTHY') { 'Info' } elseif ($health -eq 'PARTIALLY_HEALTHY') { 'Warning' } else { 'Error' }
+                $replica = "$(Get-RcaProp $r 'replica_server_name')"
+                $events.Add((New-TimelineEvent -Timestamp $stamp -Node $replica -Source 'SqlHaDmv' -Severity $sev `
+                    -Message "AG '$(Get-RcaProp $r 'ag_name')' replica '$replica' role=$(Get-RcaProp $r 'role_desc') health=$health connected=$(Get-RcaProp $r 'connected_state_desc') op=$(Get-RcaProp $r 'operational_state_desc')" `
+                    -Data @{ Kind = 'Replica'; Role = "$(Get-RcaProp $r 'role_desc')"; Health = $health })); $count++
+            }
+            foreach ($r in $db) {
+                $health = "$(Get-RcaProp $r 'synchronization_health_desc')"
+                $suspended = "$(Get-RcaProp $r 'is_suspended')"
+                $bad = ($health -ne 'HEALTHY') -or ($suspended -eq '1' -or $suspended -eq 'True')
+                $sev = if ($bad) { 'Error' } else { 'Info' }
+                $replica = "$(Get-RcaProp $r 'replica_server_name')"
+                $events.Add((New-TimelineEvent -Timestamp $stamp -Node $replica -Source 'SqlHaDmv' -Severity $sev `
+                    -Message "DB '$(Get-RcaProp $r 'db_name')' on '$replica' sync=$(Get-RcaProp $r 'synchronization_state_desc') health=$health suspended=$suspended lastCommit=$(Get-RcaProp $r 'last_commit_time') sendQ=$(Get-RcaProp $r 'log_send_queue_size') redoQ=$(Get-RcaProp $r 'redo_queue_size')" `
+                    -Data @{ Kind = 'Database'; Db = "$(Get-RcaProp $r 'db_name')" })); $count++
+            }
+            foreach ($r in $clu) {
+                $qstate = "$(Get-RcaProp $r 'quorum_state_desc')"
+                $sev = if ($qstate -match '(?i)normal') { 'Info' } else { 'Warning' }
+                $events.Add((New-TimelineEvent -Timestamp $stamp -Node $inst -Source 'SqlHaDmv' -Severity $sev `
+                    -Message "WSFC '$(Get-RcaProp $r 'cluster_name')' quorum=$(Get-RcaProp $r 'quorum_type_desc') state=$qstate" `
+                    -Data @{ Kind = 'Cluster' })); $count++
+            }
+            foreach ($r in $idn) {
+                $events.Add((New-TimelineEvent -Timestamp $stamp -Node $inst -Source 'SqlHaDmv' -Severity 'Info' `
+                    -Message "Instance '$(Get-RcaProp $r 'server_name')' clustered=$(Get-RcaProp $r 'is_clustered') hadr=$(Get-RcaProp $r 'is_hadr') physicalNode=$(Get-RcaProp $r 'physical_node')" `
+                    -Data @{ Kind = 'Identity'; PhysicalNode = "$(Get-RcaProp $r 'physical_node')" })); $count++
+            }
+            foreach ($r in $fci) {
+                $st = "$(Get-RcaProp $r 'status_description')"
+                $sev = if ($st -eq 'UP') { 'Info' } else { 'Warning' }
+                $events.Add((New-TimelineEvent -Timestamp $stamp -Node $inst -Source 'SqlHaDmv' -Severity $sev `
+                    -Message "FCI node '$(Get-RcaProp $r 'NodeName')' status=$st currentOwner=$(Get-RcaProp $r 'is_current_owner')" `
+                    -Data @{ Kind = 'FciNode' })); $count++
+            }
+        }
+        catch {
+            if (-not $errDetail) { $errDetail = $_.Exception.Message }
+        }
+
+        $state = if ($errDetail) { 'Partial' } else { 'Ok' }
+        $status.Add((New-CollectionStatus -Node $inst -Source 'SqlHaDmv' -State $state -ItemCount $count -Detail "$($rep.Count) replica(s), $($db.Count) db-replica row(s)."))
+    }
+
+    @{ Events = $events.ToArray(); Status = $status.ToArray() }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Collectors\Get-WindowsEventData.ps1:
+<#
+    Collector 3/6 - Windows Event logs (System, Application, FailoverClustering/Operational).
+    Runs Get-WinEvent inside each node's PSSession for the analysis window, pulling the
+    event IDs of interest (Data\eventid.map.json) plus all Warning+ FailoverClustering ops
+    events. Returns @{ Events = [Rca.TimelineEvent[]]; Status = [Rca.CollectionStatus[]] }.
+#>
+
+function Get-WindowsEventData {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string[]]$Node,
+        [hashtable]$Session = @{},
+        [datetime]$WindowStart,
+        [datetime]$WindowEnd,
+        [pscredential]$Credential
+    )
+    $events = [System.Collections.Generic.List[object]]::new()
+    $status = [System.Collections.Generic.List[object]]::new()
+    $winIds = Get-RcaWindowsEventIds
+
+    $remote = {
+        param($start, $end, $ids)
+        $out = [System.Collections.Generic.List[object]]::new()
+        foreach ($log in 'System', 'Application') {
+            try {
+                Get-WinEvent -FilterHashtable @{ LogName = $log; Id = $ids; StartTime = $start; EndTime = $end } -ErrorAction Stop |
+                    ForEach-Object {
+                        $out.Add([pscustomobject]@{
+                            TimeCreated = $_.TimeCreated; Id = $_.Id; Level = $_.LevelDisplayName
+                            Provider = $_.ProviderName; Log = $log; Message = $_.Message })
+                    }
+            } catch { }
+        }
+        try {
+            Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-FailoverClustering/Operational'; Level = 1, 2, 3; StartTime = $start; EndTime = $end } -ErrorAction Stop |
+                ForEach-Object {
+                    $out.Add([pscustomobject]@{
+                        TimeCreated = $_.TimeCreated; Id = $_.Id; Level = $_.LevelDisplayName
+                        Provider = $_.ProviderName; Log = 'FailoverClustering/Operational'; Message = $_.Message })
+                }
+        } catch { }
+        $out.ToArray()
+    }
+
+    foreach ($n in $Node) {
+        $sess = $Session[$n]
+        if (-not $sess) {
+            $status.Add((New-CollectionStatus -Node $n -Source 'WindowsEvent' -State 'Failed' -Detail 'No remote session (node unreachable).'))
+            continue
+        }
+        try {
+            $raw = @(Invoke-RcaRemote -Session $sess -ScriptBlock $remote -ArgumentList @($WindowStart, $WindowEnd, $winIds))
+            foreach ($r in $raw) {
+                $meaning = Get-RcaWindowsEventMeaning ([string]$r.Id)
+                $msg = if ($meaning) { "[$($r.Id)] $meaning - $(Get-RcaFirstLine $r.Message)" } else { "[$($r.Id)] $(Get-RcaFirstLine $r.Message)" }
+                $events.Add((New-TimelineEvent -Timestamp $r.TimeCreated -Node $n -Source 'WindowsEvent' `
+                    -Severity (ConvertTo-RcaSeverity $r.Level) -EventId ([string]$r.Id) -Message $msg `
+                    -Data @{ Provider = $r.Provider; Log = $r.Log }))
+            }
+            $status.Add((New-CollectionStatus -Node $n -Source 'WindowsEvent' -State 'Ok' -ItemCount $raw.Count -Detail "$($raw.Count) event(s) in window."))
+        }
+        catch {
+            $status.Add((New-CollectionStatus -Node $n -Source 'WindowsEvent' -State 'Failed' -Detail $_.Exception.Message))
+        }
+    }
+
+    @{ Events = $events.ToArray(); Status = $status.ToArray() }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Collectors\Get-WsfcStateData.ps1:
+<#
+    Collector 2/6 - WSFC cluster state snapshot. Uses the FailoverClusters module inside
+    each node's PSSession to capture node states/weights, group ownership, non-Online
+    resources, and quorum config. These are current-state facts (timestamped 'as of now')
+    that give the rules engine context about who owns what and whether quorum is healthy.
+#>
+
+function Get-WsfcStateData {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string[]]$Node,
+        [hashtable]$Session = @{},
+        [datetime]$WindowStart,
+        [datetime]$WindowEnd,
+        [pscredential]$Credential
+    )
+    $events = [System.Collections.Generic.List[object]]::new()
+    $status = [System.Collections.Generic.List[object]]::new()
+
+    $remote = {
+        Import-Module FailoverClusters -ErrorAction Stop
+        $nodes = Get-ClusterNode | ForEach-Object {
+            [pscustomobject]@{ Name = $_.Name; State = "$($_.State)"; NodeWeight = $_.NodeWeight; DynamicWeight = $_.DynamicWeight }
+        }
+        $groups = Get-ClusterGroup | ForEach-Object {
+            [pscustomobject]@{ Name = $_.Name; Owner = "$($_.OwnerNode)"; State = "$($_.State)" }
+        }
+        $res = Get-ClusterResource | Where-Object { "$($_.State)" -ne 'Online' } | ForEach-Object {
+            [pscustomobject]@{ Name = $_.Name; Group = "$($_.OwnerGroup)"; Owner = "$($_.OwnerNode)"; State = "$($_.State)"; Type = "$($_.ResourceType)" }
+        }
+        $q = Get-ClusterQuorum
+        [pscustomobject]@{
+            Nodes        = $nodes
+            Groups       = $groups
+            ResourcesBad = $res
+            QuorumType   = "$($q.QuorumType)"
+            QuorumRes    = "$($q.QuorumResource)"
+        }
+    }
+
+    foreach ($n in $Node) {
+        $sess = $Session[$n]
+        if (-not $sess) {
+            $status.Add((New-CollectionStatus -Node $n -Source 'WsfcState' -State 'Failed' -Detail 'No remote session (node unreachable).'))
+            continue
+        }
+        try {
+            $snap = Invoke-RcaRemote -Session $sess -ScriptBlock $remote
+            $stamp = $WindowEnd
+            $count = 0
+
+            foreach ($nd in @($snap.Nodes)) {
+                $sev = if ($nd.State -ne 'Up') { 'Error' } else { 'Info' }
+                $events.Add((New-TimelineEvent -Timestamp $stamp -Node $n -Source 'WsfcState' -Severity $sev `
+                    -Message "Node '$($nd.Name)' state=$($nd.State) weight=$($nd.NodeWeight) dynamicWeight=$($nd.DynamicWeight)" `
+                    -Data @{ Kind = 'Node'; Name = $nd.Name; State = $nd.State })); $count++
+            }
+            foreach ($g in @($snap.Groups)) {
+                $sev = if ($g.State -notin 'Online', 'Offline') { 'Warning' } elseif ($g.State -eq 'Offline') { 'Error' } else { 'Info' }
+                $events.Add((New-TimelineEvent -Timestamp $stamp -Node $n -Source 'WsfcState' -Severity $sev `
+                    -Message "Group '$($g.Name)' owner=$($g.Owner) state=$($g.State)" `
+                    -Data @{ Kind = 'Group'; Name = $g.Name; Owner = $g.Owner; State = $g.State })); $count++
+            }
+            foreach ($r in @($snap.ResourcesBad)) {
+                $events.Add((New-TimelineEvent -Timestamp $stamp -Node $n -Source 'WsfcState' -Severity 'Error' `
+                    -Message "Resource '$($r.Name)' ($($r.Type)) in group '$($r.Group)' state=$($r.State)" `
+                    -Data @{ Kind = 'Resource'; Name = $r.Name; State = $r.State })); $count++
+            }
+            $events.Add((New-TimelineEvent -Timestamp $stamp -Node $n -Source 'WsfcState' -Severity 'Info' `
+                -Message "Quorum type=$($snap.QuorumType) resource=$($snap.QuorumRes)" `
+                -Data @{ Kind = 'Quorum'; Type = $snap.QuorumType })); $count++
+
+            $status.Add((New-CollectionStatus -Node $n -Source 'WsfcState' -State 'Ok' -ItemCount $count -Detail "Snapshot: $($snap.Nodes.Count) node(s), $($snap.Groups.Count) group(s)."))
+        }
+        catch {
+            $status.Add((New-CollectionStatus -Node $n -Source 'WsfcState' -State 'Failed' -Detail $_.Exception.Message))
+        }
+    }
+
+    @{ Events = $events.ToArray(); Status = $status.ToArray() }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Normalize\ConvertTo-TimelineEvent.ps1:
+<#
+    Normalizer - merges per-collector event arrays into one time-ordered timeline.
+    Phase 0: simply concatenates and sorts; per-source parsing lives in the collectors.
+#>
+
+function ConvertTo-TimelineEvent {
+    [CmdletBinding()]
+    param(
+        # One or more @{ Events = ...; Status = ... } collector results.
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [object[]]$CollectorResult
+    )
+    begin { $all = [System.Collections.Generic.List[object]]::new() }
+    process {
+        foreach ($r in $CollectorResult) {
+            # Collector results are hashtables; Get-RcaProp reads 'Events' from a hashtable
+            # OR an object (PSObject.Properties does NOT expose hashtable keys).
+            $ev = Get-RcaProp $r 'Events'
+            if ($ev) { foreach ($e in $ev) { $all.Add($e) } }
+        }
+    }
+    end {
+        # Stable chronological order; null timestamps sink to the end.
+        $all | Sort-Object @{ Expression = { if ($_.Timestamp) { $_.Timestamp } else { [datetime]::MaxValue } } }
+    }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Report\New-HtmlReport.ps1:
+<#
+    HTML reporter - a single self-contained file (inline CSS + a little vanilla JS, no
+    external dependencies, works offline and is safe to email). Renders:
+      - a verdict card (primary finding + confidence + remediation + evidence chain),
+      - ranked findings with confidence bars and KB links,
+      - a filterable, color-coded cross-node timeline (filter by text/source/severity/node),
+      - per-source collection status.
+    Phase 4. Public surface unchanged: New-HtmlReport -RcaResult <obj> -Path <file> -> path.
+#>
+
+function ConvertTo-RcaHtmlEncoded {
+    param([string]$s)
+    if ($null -eq $s) { return '' }
+    [System.Net.WebUtility]::HtmlEncode($s)
+}
+
+# Lower-cased, HTML-safe token for use in a CSS class (never $null).
+function Get-RcaCssToken {
+    param([string]$s)
+    if (-not $s) { return 'none' }
+    ($s -replace '[^A-Za-z0-9]', '').ToLower()
+}
+
+function New-HtmlReport {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$RcaResult,
+        [Parameter(Mandatory)][string]$Path
+    )
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+
+    $enc = { param($x) ConvertTo-RcaHtmlEncoded $x }
+    function Format-RcaTime { param($t)
+        if (-not $t) { return '(no time)' }
+        try { return ([datetime]$t).ToString('yyyy-MM-dd HH:mm:ss.fff') } catch { return "$t" }
+    }
+
+    # --- Verdict ------------------------------------------------------------
+    $primary = $RcaResult.PrimaryFinding
+    if ($primary) {
+        $vClass = Get-RcaCssToken $primary.Severity
+        $verdictHtml = @"
+    <div class="v">$(& $enc $primary.Category) <span class="sev sev-$vClass">$(& $enc $primary.Severity)</span> <span class="conf">$($primary.Confidence)% confidence</span></div>
+    <p class="explain">$(& $enc $primary.Explanation)</p>
+    <p class="remediation"><b>Recommended action:</b> $(& $enc $primary.Remediation)$(if ($primary.KbRef) { " &nbsp;<a href=""$(& $enc $primary.KbRef)"">[reference]</a>" })</p>
+"@
+        $ev = @($primary.Evidence) | Select-Object -First 6
+        if ($ev) {
+            $evRows = foreach ($e in $ev) {
+                "<li><code>$(& $enc (Format-RcaTime $e.Timestamp))</code> &middot; <b>$(& $enc $e.Node)</b> &middot; $(& $enc $e.Source) &middot; $(& $enc $e.Message)</li>"
+            }
+            $verdictHtml += @"
+    <details open><summary>Evidence ($(@($primary.Evidence).Count))</summary><ul class="evidence">$($evRows -join "`n")</ul></details>
+"@
+        }
+    } else {
+        $verdictHtml = '<div class="v muted">No fault root cause identified for this window.</div>'
+    }
+
+    # --- Findings table -----------------------------------------------------
+    $findingRows = foreach ($f in @($RcaResult.Findings)) {
+        $sc = Get-RcaCssToken $f.Severity
+        $planned = if ($f.IsPlanned) { ' <span class="tag">planned</span>' } else { '' }
+        $kb = if ($f.KbRef) { "<a href=""$(& $enc $f.KbRef)"">KB</a>" } else { '' }
+        @"
+      <tr>
+        <td><span class="sev sev-$sc">$(& $enc $f.Severity)</span></td>
+        <td class="confcell"><div class="bar"><div class="fill fill-$sc" style="width:$([int]$f.Confidence)%"></div></div><span>$([int]$f.Confidence)%</span></td>
+        <td><b>$(& $enc $f.Category)</b>$planned<br><span class="muted">$(& $enc $f.RuleId)</span></td>
+        <td>$(& $enc $f.Explanation)</td>
+        <td>$(& $enc $f.Remediation) $kb</td>
+      </tr>
+"@
+    }
+    if (-not $findingRows) { $findingRows = '<tr><td colspan="5" class="muted">No findings.</td></tr>' }
+
+    # --- Timeline (filterable) ---------------------------------------------
+    $tl = @($RcaResult.Timeline)
+    $timelineRows = foreach ($e in $tl) {
+        $sc = Get-RcaCssToken $e.Severity
+        @"
+      <tr data-source="$(& $enc $e.Source)" data-sev="$(& $enc $e.Severity)" data-node="$(& $enc $e.Node)">
+        <td class="nowrap">$(& $enc (Format-RcaTime $e.Timestamp))</td>
+        <td>$(& $enc $e.Node)</td>
+        <td>$(& $enc $e.Source)</td>
+        <td><span class="dot dot-$sc"></span>$(& $enc $e.Severity)</td>
+        <td>$(& $enc $e.EventId)</td>
+        <td>$(& $enc $e.Message)</td>
+      </tr>
+"@
+    }
+    if (-not $timelineRows) { $timelineRows = '<tr><td colspan="6" class="muted">No timeline events.</td></tr>' }
+
+    $optionList = { param($values)
+        ($values | Where-Object { $_ } | Sort-Object -Unique | ForEach-Object { "<option value=""$(& $enc $_)"">$(& $enc $_)</option>" }) -join ''
+    }
+    $srcOpts  = & $optionList ($tl | ForEach-Object { $_.Source })
+    $sevOpts  = & $optionList ($tl | ForEach-Object { $_.Severity })
+    $nodeOpts = & $optionList ($tl | ForEach-Object { $_.Node })
+
+    # --- Collection status --------------------------------------------------
+    $statusRows = foreach ($s in @($RcaResult.CollectionStatus)) {
+        $st = Get-RcaCssToken $s.State
+        @"
+      <tr>
+        <td>$(& $enc $s.Node)</td>
+        <td>$(& $enc $s.Source)</td>
+        <td class="state-$st">$(& $enc $s.State)</td>
+        <td>$($s.ItemCount)</td>
+        <td>$(& $enc $s.Detail)</td>
+      </tr>
+"@
+    }
+    if (-not $statusRows) { $statusRows = '<tr><td colspan="5" class="muted">No collection status.</td></tr>' }
+
+    $genStamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz')
+
+    $html = @"
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Failover RCA - $(& $enc $RcaResult.ClusterName)</title>
+<style>
+  :root{--ink:#1b1f23;--accent:#0b3d61}
+  *{box-sizing:border-box}
+  body{font-family:Segoe UI,Arial,sans-serif;margin:0;background:#f4f6f8;color:var(--ink)}
+  header{background:var(--accent);color:#fff;padding:18px 24px}
+  header h1{margin:0;font-size:20px} header .sub{opacity:.85;font-size:13px;margin-top:6px;line-height:1.6}
+  main{padding:20px 24px;max-width:1280px;margin:0 auto}
+  .verdict{background:#fff;border-left:6px solid var(--accent);padding:16px 18px;margin-bottom:20px;border-radius:4px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+  .verdict h2{margin:0 0 8px;font-size:13px;color:#64748b;font-weight:600;text-transform:uppercase;letter-spacing:.05em}
+  .verdict .v{font-size:19px;font-weight:600;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .verdict .conf{font-size:14px;color:#475569;font-weight:500}
+  .verdict .explain{margin:10px 0 6px;line-height:1.5}
+  .verdict .remediation{margin:6px 0;line-height:1.5}
+  details{margin-top:10px} summary{cursor:pointer;font-weight:600;color:#475569}
+  ul.evidence{margin:8px 0;padding-left:18px;font-size:13px;line-height:1.7} ul.evidence code{background:#eef2f6;padding:1px 5px;border-radius:3px}
+  section{background:#fff;padding:16px 18px;margin-bottom:18px;border-radius:4px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+  section h2{margin:0 0 12px;font-size:16px}
+  table{border-collapse:collapse;width:100%;font-size:13px}
+  th,td{border-bottom:1px solid #e2e8f0;padding:7px 9px;text-align:left;vertical-align:top}
+  th{background:#f1f5f9;font-weight:600;position:sticky;top:0}
+  .nowrap{white-space:nowrap} .muted{color:#94a3b8;font-style:italic}
+  .sev{padding:2px 9px;border-radius:10px;font-size:11px;font-weight:700;color:#fff;display:inline-block}
+  .sev-critical{background:#b91c1c} .sev-high{background:#c2410c} .sev-medium{background:#a16207} .sev-low{background:#64748b}
+  .tag{background:#e2e8f0;color:#475569;padding:1px 7px;border-radius:8px;font-size:10px;font-weight:700;text-transform:uppercase}
+  .confcell{white-space:nowrap} .confcell span{font-size:12px;margin-left:6px;color:#475569}
+  .bar{display:inline-block;width:90px;height:9px;background:#e2e8f0;border-radius:5px;overflow:hidden;vertical-align:middle}
+  .fill{height:100%} .fill-critical{background:#b91c1c} .fill-high{background:#c2410c} .fill-medium{background:#a16207} .fill-low{background:#64748b} .fill-none{background:#94a3b8}
+  .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;vertical-align:middle}
+  .dot-critical{background:#b91c1c} .dot-error{background:#c2410c} .dot-warning{background:#a16207} .dot-info{background:#94a3b8} .dot-none{background:#cbd5e1}
+  .state-ok{color:#15803d;font-weight:600} .state-partial{color:#a16207;font-weight:600} .state-failed{color:#b91c1c;font-weight:600} .state-skipped{color:#94a3b8}
+  .filters{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px;align-items:center}
+  .filters input,.filters select{padding:5px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:13px}
+  .filters input{flex:1;min-width:180px}
+  .count{font-size:12px;color:#64748b;margin-left:auto}
+</style></head><body>
+<header>
+  <h1>SQL Server Failover - Root-Cause Report</h1>
+  <div class="sub">
+    Cluster: <b>$(& $enc $RcaResult.ClusterName)</b> &nbsp;|&nbsp;
+    Nodes: $(& $enc ($RcaResult.Nodes -join ', ')) &nbsp;|&nbsp;
+    AG: $(& $enc $RcaResult.AvailabilityGroup) &nbsp;|&nbsp;
+    Event time: $(& $enc (Format-RcaTime $RcaResult.EventTime)) &nbsp;|&nbsp;
+    Window: $(& $enc (Format-RcaTime $RcaResult.WindowStart)) -> $(& $enc (Format-RcaTime $RcaResult.WindowEnd))
+  </div>
+</header>
+<main>
+  <div class="verdict"><h2>Verdict</h2>
+$verdictHtml
+  </div>
+
+  <section><h2>Ranked findings</h2>
+    <table><thead><tr><th>Severity</th><th>Confidence</th><th>Category</th><th>Explanation</th><th>Remediation</th></tr></thead>
+    <tbody>$($findingRows -join "`n")</tbody></table>
+  </section>
+
+  <section><h2>Timeline <span class="muted">($($tl.Count) events)</span></h2>
+    <div class="filters">
+      <input id="flt-text" type="text" placeholder="Filter by text...">
+      <select id="flt-source"><option value="">All sources</option>$srcOpts</select>
+      <select id="flt-sev"><option value="">All severities</option>$sevOpts</select>
+      <select id="flt-node"><option value="">All nodes</option>$nodeOpts</select>
+      <span class="count">showing <b id="tl-count">0</b></span>
+    </div>
+    <table id="timeline"><thead><tr><th>Time</th><th>Node</th><th>Source</th><th>Severity</th><th>Event</th><th>Message</th></tr></thead>
+    <tbody>$($timelineRows -join "`n")</tbody></table>
+  </section>
+
+  <section><h2>Collection status</h2>
+    <table><thead><tr><th>Node / Instance</th><th>Source</th><th>State</th><th>Items</th><th>Detail</th></tr></thead>
+    <tbody>$($statusRows -join "`n")</tbody></table>
+  </section>
+
+  <p class="muted">Generated $genStamp by SqlFailoverClusterRCA.</p>
+</main>
+<script>
+(function(){
+  var rows = Array.prototype.slice.call(document.querySelectorAll('#timeline tbody tr'));
+  var q = document.getElementById('flt-text');
+  var fs = document.getElementById('flt-source');
+  var fv = document.getElementById('flt-sev');
+  var fn = document.getElementById('flt-node');
+  var counter = document.getElementById('tl-count');
+  function apply(){
+    var t = (q.value||'').toLowerCase();
+    var s = fs.value, v = fv.value, n = fn.value, shown = 0;
+    rows.forEach(function(r){
+      if(!r.getAttribute('data-source')){ return; }
+      var ok = (!s || r.getAttribute('data-source')===s)
+            && (!v || r.getAttribute('data-sev')===v)
+            && (!n || r.getAttribute('data-node')===n)
+            && (!t || r.textContent.toLowerCase().indexOf(t)>=0);
+      r.style.display = ok ? '' : 'none';
+      if(ok){ shown++; }
+    });
+    counter.textContent = shown;
+  }
+  [q,fs,fv,fn].forEach(function(el){ el.addEventListener('input', apply); el.addEventListener('change', apply); });
+  apply();
+})();
+</script>
+</body></html>
+"@
+
+    Set-Content -Path $Path -Value $html -Encoding UTF8
+    Write-RcaLog "Wrote HTML report: $Path" -Level Info
+    $Path
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Report\New-JsonReport.ps1:
+<#
+    JSON reporter - serializes the full RcaResult for archiving / trend analysis.
+#>
+
+function New-JsonReport {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$RcaResult,
+        [Parameter(Mandatory)][string]$Path
+    )
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+
+    $RcaResult | ConvertTo-Json -Depth 12 | Set-Content -Path $Path -Encoding UTF8
+    Write-RcaLog "Wrote JSON report: $Path" -Level Info
+    $Path
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Types.ps1:
+<#
+    Data-shape factories. Each returns a [pscustomobject] tagged with a PSTypeName so
+    callers / Pester / Format.ps1xml can identify shapes without PowerShell classes.
+#>
+
+function New-TimelineEvent {
+    [CmdletBinding()]
+    param(
+        [datetime]$Timestamp,
+        [string]$Node,
+        [ValidateSet('ClusterLog', 'WsfcState', 'WindowsEvent', 'SqlErrorLog', 'SqlHaDmv', 'NodeHealth')]
+        [string]$Source,
+        [ValidateSet('Info', 'Warning', 'Error', 'Critical')]
+        [string]$Severity = 'Info',
+        [string]$EventId,
+        [string]$Message,
+        [hashtable]$Data = @{}
+    )
+    [pscustomobject]@{
+        PSTypeName = 'Rca.TimelineEvent'
+        Timestamp  = $Timestamp
+        Node       = $Node
+        Source     = $Source
+        Severity   = $Severity
+        EventId    = $EventId
+        Message    = $Message
+        Data       = $Data
+    }
+}
+
+function New-RootCauseFinding {
+    [CmdletBinding()]
+    param(
+        [string]$RuleId,
+        [string]$Category,
+        [ValidateSet('Low', 'Medium', 'High', 'Critical')]
+        [string]$Severity = 'Medium',
+        [ValidateRange(0, 100)]
+        [int]$Confidence = 0,
+        [string]$Explanation,
+        [string]$Remediation,
+        [string]$KbRef,
+        [object[]]$Evidence = @(),
+        [bool]$IsPlanned = $false
+    )
+    [pscustomobject]@{
+        PSTypeName  = 'Rca.RootCauseFinding'
+        RuleId      = $RuleId
+        Category    = $Category
+        Severity    = $Severity
+        Confidence  = $Confidence
+        Explanation = $Explanation
+        Remediation = $Remediation
+        KbRef       = $KbRef
+        Evidence    = $Evidence
+        IsPlanned   = $IsPlanned
+    }
+}
+
+function New-CollectionStatus {
+    [CmdletBinding()]
+    param(
+        [string]$Node,
+        [string]$Source,
+        [ValidateSet('Ok', 'Partial', 'Failed', 'Skipped')]
+        [string]$State = 'Ok',
+        [int]$ItemCount = 0,
+        [string]$Detail
+    )
+    [pscustomobject]@{
+        PSTypeName = 'Rca.CollectionStatus'
+        Node       = $Node
+        Source     = $Source
+        State      = $State
+        ItemCount  = $ItemCount
+        Detail     = $Detail
+    }
+}
+
+function New-RcaResult {
+    [CmdletBinding()]
+    param(
+        [string]$ClusterName,
+        [string[]]$Nodes = @(),
+        [string]$AvailabilityGroup,
+        [datetime]$EventTime,
+        [datetime]$WindowStart,
+        [datetime]$WindowEnd,
+        [object[]]$Timeline = @(),
+        [object[]]$Findings = @(),
+        [object[]]$CollectionStatus = @(),
+        [string]$EvidencePath
+    )
+    [pscustomobject]@{
+        PSTypeName        = 'Rca.RcaResult'
+        ClusterName       = $ClusterName
+        Nodes             = $Nodes
+        AvailabilityGroup = $AvailabilityGroup
+        EventTime         = $EventTime
+        WindowStart       = $WindowStart
+        WindowEnd         = $WindowEnd
+        Timeline          = $Timeline
+        Findings          = $Findings
+        CollectionStatus  = $CollectionStatus
+        EvidencePath      = $EvidencePath
+        # PrimaryFinding = highest-confidence non-planned finding (computed on demand).
+        PrimaryFinding    = $null
+    }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Util\Connect-ClusterNode.ps1:
+<#
+    PSRemoting session management with throttling and a module-scoped cache. Opens (or
+    reuses) one PSSession per node. Connection failures are NON-FATAL: the returned
+    descriptor reports Connected=$false plus the error, so collectors can record a 'Failed'
+    collection status and the run can continue with partial evidence.
+#>
+
+function Connect-ClusterNode {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string[]]$Node,
+        [pscredential]$Credential,
+        [int]$ThrottleLimit = 4,
+        [int]$OpenTimeoutMs = 6000
+    )
+
+    $opt = New-PSSessionOption -OpenTimeout $OpenTimeoutMs -OperationTimeout 0 -IdleTimeout 900000
+    $connErr = @()
+
+    # Names that mean "this machine" - collected once for local-node detection.
+    $localNames = @($env:COMPUTERNAME, 'localhost', '.', '127.0.0.1', '::1')
+    try { $localNames += [System.Net.Dns]::GetHostEntry('').HostName } catch { }
+
+    # Which nodes still need a live session? (Local nodes get an in-process sentinel.)
+    $toOpen = @()
+    foreach ($n in $Node) {
+        $existing = $script:RcaSessions[$n]
+        if ($existing) { continue }   # already have a session or local sentinel
+        $isLocal = ($localNames -contains $n) -or ($n -like "$env:COMPUTERNAME.*")
+        if ($isLocal) {
+            $script:RcaSessions[$n] = [pscustomobject]@{ PSTypeName = 'Rca.LocalSession'; Node = $n; IsLocal = $true }
+            Write-RcaLog "Connect-ClusterNode: '$n' is the local machine; using in-process execution." -Level Debug
+            continue
+        }
+        $toOpen += $n
+    }
+
+    if ($toOpen.Count -gt 0) {
+        $splat = @{
+            ComputerName  = $toOpen
+            ThrottleLimit = $ThrottleLimit
+            SessionOption = $opt
+            ErrorAction   = 'SilentlyContinue'
+            ErrorVariable = '+connErr'
+        }
+        if ($Credential) { $splat.Credential = $Credential }
+        Write-RcaLog "Opening PSSession(s) to: $($toOpen -join ', ')" -Level Debug
+        $opened = New-PSSession @splat
+        foreach ($s in @($opened)) { $script:RcaSessions[$s.ComputerName] = $s }
+    }
+
+    foreach ($n in $Node) {
+        $s = $script:RcaSessions[$n]
+        $isLocal = [bool]($s -and ($s.PSObject.TypeNames -contains 'Rca.LocalSession'))
+        $connected = [bool]($isLocal -or ($s -is [System.Management.Automation.Runspaces.PSSession] -and $s.State -eq 'Opened'))
+        $err = $null
+        if (-not $connected) {
+            $match = $connErr | Where-Object { "$_" -match [regex]::Escape($n) } | Select-Object -First 1
+            $err = if ($match) { "$match" } else { 'connection failed' }
+            Write-RcaLog "Connect-ClusterNode: '$n' not connected ($err)" -Level Warn
+        }
+        [pscustomobject]@{
+            PSTypeName = 'Rca.NodeSession'
+            Node       = $n
+            Connected  = $connected
+            Session    = $s
+            Error      = $err
+        }
+    }
+}
+
+# Return the cached usable session for a node (open PSSession or local sentinel), else $null.
+function Get-RcaSession {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Node)
+    $s = $script:RcaSessions[$Node]
+    if (-not $s) { return $null }
+    if ($s.PSObject.TypeNames -contains 'Rca.LocalSession') { return $s }
+    if ($s -is [System.Management.Automation.Runspaces.PSSession] -and $s.State -eq 'Opened') { return $s }
+    $null
+}
+
+# Tear down cached sessions (all, or a specific set). Safe to call repeatedly.
+function Disconnect-ClusterNode {
+    [CmdletBinding()]
+    param([string[]]$Node)
+    $targets = if ($PSBoundParameters.ContainsKey('Node')) { $Node } else { @($script:RcaSessions.Keys) }
+    foreach ($n in @($targets)) {
+        $s = $script:RcaSessions[$n]
+        if ($s) {
+            if ($s -is [System.Management.Automation.Runspaces.PSSession]) {
+                try { Remove-PSSession $s -ErrorAction SilentlyContinue } catch { }
+            }
+            [void]$script:RcaSessions.Remove($n)
+        }
+    }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Util\Get-RcaData.ps1:
+<#
+    Cached loaders for the static data files (Data\eventid.map.json, Data\rules.catalog.json)
+    plus small shared helpers used by the rules engine. Loaded early (see module load order)
+    so the Rules\*.ps1 files can call Get-RcaRuleMeta / Get-RcaConfidence at load time.
+#>
+
+# Strict-safe property/key read from a row object or hashtable (returns $Default if absent).
+# DMV column sets vary across SQL 2016-2022, so collectors read fields through this.
+function Get-RcaProp {
+    param($Obj, [Parameter(Mandatory)][string]$Name, $Default = $null)
+    if ($null -eq $Obj) { return $Default }
+    if ($Obj -is [hashtable]) {
+        if ($Obj.ContainsKey($Name)) { return $Obj[$Name] } else { return $Default }
+    }
+    $p = $Obj.PSObject.Properties[$Name]
+    if ($p) { $p.Value } else { $Default }
+}
+
+# Strict-safe read of a module-scope variable (returns $null if it has never been set).
+function Get-RcaScriptVar {
+    param([Parameter(Mandatory)][string]$Name)
+    $v = Get-Variable -Name $Name -Scope Script -ErrorAction SilentlyContinue
+    if ($v) { $v.Value } else { $null }
+}
+
+function Get-RcaEventMap {
+    [CmdletBinding()]
+    param()
+    if ($null -eq (Get-RcaScriptVar 'RcaEventMap')) {
+        $path = Join-Path $script:ModuleRoot 'Data\eventid.map.json'
+        if (Test-Path $path) {
+            $script:RcaEventMap = Get-Content $path -Raw -Encoding UTF8 | ConvertFrom-Json
+        } else {
+            $script:RcaEventMap = [pscustomobject]@{ windows = [pscustomobject]@{}; sql = [pscustomobject]@{} }
+        }
+    }
+    $script:RcaEventMap
+}
+
+# Integer Windows event IDs the collectors should pull from System/Application.
+function Get-RcaWindowsEventIds {
+    [CmdletBinding()]
+    param()
+    $win = (Get-RcaEventMap).windows
+    @($win.PSObject.Properties.Name | ForEach-Object { [int]$_ })
+}
+
+function Get-RcaWindowsEventMeaning {
+    param([string]$Id)
+    $p = (Get-RcaEventMap).windows.PSObject.Properties[$Id]
+    if ($p) { $p.Value } else { $null }
+}
+
+function Get-RcaSqlEventMeaning {
+    param([string]$Number)
+    $p = (Get-RcaEventMap).sql.PSObject.Properties[$Number]
+    if ($p) { $p.Value } else { $null }
+}
+
+function Get-RcaRuleCatalog {
+    [CmdletBinding()]
+    param()
+    if ($null -eq (Get-RcaScriptVar 'RcaRuleCatalog')) {
+        $cat = @{}
+        $path = Join-Path $script:ModuleRoot 'Data\rules.catalog.json'
+        if (Test-Path $path) {
+            $json = Get-Content $path -Raw -Encoding UTF8 | ConvertFrom-Json
+            foreach ($r in $json.rules) { $cat[$r.id] = $r }
+        }
+        $script:RcaRuleCatalog = $cat
+    }
+    $script:RcaRuleCatalog
+}
+
+# Human-facing metadata (category/severity/remediation/KB) for a rule Id. Always returns
+# an object with every field present so rule files can read them without strict-mode errors.
+function Get-RcaRuleMeta {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Id)
+    $cat = Get-RcaRuleCatalog
+    if ($cat.ContainsKey($Id)) { return $cat[$Id] }
+    [pscustomobject]@{ id = $Id; category = $Id; severity = 'Medium'; kbRef = ''; remediation = ''; isPlanned = $false }
+}
+
+# Confidence score: a base for the rule plus a bump per corroborating piece of evidence,
+# clamped to [1,Max]. Keeps scoring consistent and tunable across all rules.
+function Get-RcaConfidence {
+    [CmdletBinding()]
+    param(
+        [int]$Base = 50,
+        [int]$Corroborations = 0,
+        [int]$Per = 12,
+        [int]$Max = 98
+    )
+    $v = $Base + ($Corroborations * $Per)
+    if ($v -gt $Max) { return $Max }
+    if ($v -lt 1)    { return 1 }
+    [int]$v
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Util\Invoke-RcaRemote.ps1:
+<#
+    Shared remote-execution + mapping helpers used by the Windows-side collectors.
+    Remote work runs in the per-node PSSession opened by Connect-ClusterNode.
+#>
+
+function Invoke-RcaRemote {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Session,
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [object[]]$ArgumentList = @()
+    )
+    if ($Session -is [System.Management.Automation.Runspaces.PSSession]) {
+        Invoke-Command -Session $Session -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList -ErrorAction Stop
+    } else {
+        # Local session sentinel (Rca.LocalSession): run in-process - used when the target is
+        # this machine, so the tool works on a cluster node without WinRM loopback issues.
+        & $ScriptBlock @ArgumentList
+    }
+}
+
+# Map a Windows event LevelDisplayName (or any free text) to our timeline severity scale.
+function ConvertTo-RcaSeverity {
+    param([string]$Level)
+    switch -Regex ("$Level") {
+        'Critical' { return 'Critical' }
+        'Error'    { return 'Error' }
+        'Warn'     { return 'Warning' }
+        default    { return 'Info' }
+    }
+}
+
+# First non-empty line of a (possibly multi-line) event message, trimmed for the timeline.
+function Get-RcaFirstLine {
+    param([string]$Text, [int]$Max = 300)
+    if (-not $Text) { return '' }
+    $line = ($Text -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
+    if (-not $line) { $line = $Text }
+    $line = $line.Trim()
+    if ($line.Length -gt $Max) { $line = $line.Substring(0, $Max) + '...' }
+    $line
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Util\Invoke-SqlReadOnly.ps1:
+<#
+    Read-only SQL execution helper. Enforces the read-only contract (SPEC section 10) and
+    then executes via System.Data.SqlClient (no external module dependency - keeps the tool
+    agentless). Returns an array of pscustomobjects, one per row. Never issues write/DDL/
+    control SQL: any statement that fails Test-RcaReadOnlySql is refused before connecting.
+#>
+
+# Tokens that must never appear as a statement verb in this tool.
+$script:RcaForbiddenSql = @(
+    'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'TRUNCATE', 'DROP', 'CREATE', 'ALTER',
+    'GRANT', 'REVOKE', 'DENY', 'EXEC', 'EXECUTE', 'BACKUP', 'RESTORE', 'KILL',
+    'RECONFIGURE', 'SHUTDOWN', 'DBCC', 'WAITFOR', 'BEGIN TRAN', 'COMMIT', 'ROLLBACK'
+)
+
+# Read-only system stored procedures we genuinely need; allowed to pass the EXEC gate.
+$script:RcaAllowedProcs = @('xp_readerrorlog', 'sp_readerrorlog')
+
+function Test-RcaReadOnlySql {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)][string]$Query)
+
+    # Strip line/block comments before inspecting verbs.
+    $stripped = [regex]::Replace($Query, '--[^\r\n]*', ' ')
+    $stripped = [regex]::Replace($stripped, '/\*.*?\*/', ' ', 'Singleline')
+
+    # Permit an EXEC of an allowlisted read-only proc by neutralizing ONLY that EXEC verb,
+    # then re-checking: any OTHER forbidden verb (e.g. a piggy-backed DROP) still trips it.
+    $probe = $stripped
+    $procPattern = '(?i)\b(' + (($script:RcaAllowedProcs | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')\b'
+    if ($probe -match $procPattern) {
+        $probe = [regex]::Replace($probe, '(?i)\bexec(ute)?\b', ' ')
+    }
+
+    foreach ($verb in $script:RcaForbiddenSql) {
+        if ($probe -match "(?im)\b$([regex]::Escape($verb))\b") { return $false }
+    }
+    return $true
+}
+
+function Invoke-SqlReadOnly {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ServerInstance,
+        [Parameter(Mandatory)][string]$Query,
+        [string]$Database = 'master',
+        [pscredential]$Credential,
+        [int]$TimeoutSeconds = 30,
+        [int]$ConnectTimeoutSeconds = 5,
+        # Validate the read-only contract without opening a connection (used by tests).
+        [switch]$ValidateOnly
+    )
+
+    if (-not (Test-RcaReadOnlySql -Query $Query)) {
+        throw "Invoke-SqlReadOnly: refused a non-read-only statement (read-only contract, SPEC section 10)."
+    }
+    if ($ValidateOnly) { return @() }
+
+    $cs = "Server=$ServerInstance;Database=$Database;Application Name=SqlFailoverClusterRCA;" +
+          "Connect Timeout=$ConnectTimeoutSeconds;TrustServerCertificate=True;"
+    if ($Credential) {
+        $cs += "User ID=$($Credential.UserName);Password=$($Credential.GetNetworkCredential().Password);"
+    } else {
+        $cs += "Integrated Security=SSPI;"
+    }
+
+    $conn = New-Object System.Data.SqlClient.SqlConnection $cs
+    try {
+        $conn.Open()
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandText = $Query
+        $cmd.CommandTimeout = $TimeoutSeconds
+        $reader = $cmd.ExecuteReader()
+        $rows = [System.Collections.Generic.List[object]]::new()
+        do {
+            while ($reader.Read()) {
+                $o = [ordered]@{}
+                for ($i = 0; $i -lt $reader.FieldCount; $i++) {
+                    $name = $reader.GetName($i)
+                    $val  = $reader.GetValue($i)
+                    if ($val -is [System.DBNull]) { $val = $null }
+                    $o[$name] = $val
+                }
+                $rows.Add([pscustomobject]$o)
+            }
+        } while ($reader.NextResult())
+        $reader.Close()
+        Write-RcaLog "Invoke-SqlReadOnly: $ServerInstance [$Database] returned $($rows.Count) row(s)." -Level Debug
+        # Emit rows normally (no unary comma) - callers wrap in @() to normalize.
+        $rows.ToArray()
+    }
+    finally {
+        $conn.Dispose()
+    }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Util\Resolve-Failover.ps1:
+<#
+    Runtime resolvers used by Invoke-FailoverRCA:
+      - Resolve-ClusterNode : expand a cluster name into its member node names.
+      - Find-LatestFailover : auto-detect the most recent failover time when -EventTime
+                              is not supplied, by scanning FailoverClustering events.
+    Both are best-effort and degrade gracefully (return a sensible fallback, never throw).
+#>
+
+function Resolve-ClusterNode {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ClusterName,
+        [pscredential]$Credential,
+        [int]$OpenTimeoutMs = 6000
+    )
+    try {
+        $opt = New-PSSessionOption -OpenTimeout $OpenTimeoutMs
+        $splat = @{
+            ComputerName  = $ClusterName
+            SessionOption = $opt
+            ErrorAction   = 'Stop'
+            ScriptBlock   = { Import-Module FailoverClusters -ErrorAction Stop; (Get-ClusterNode).Name }
+        }
+        if ($Credential) { $splat.Credential = $Credential }
+        $names = Invoke-Command @splat
+        if ($names) {
+            Write-RcaLog "Resolve-ClusterNode: '$ClusterName' -> $(@($names) -join ', ')" -Level Info
+            return , @($names)
+        }
+    }
+    catch {
+        Write-RcaLog "Resolve-ClusterNode: could not expand '$ClusterName' ($($_.Exception.Message)); treating it as a single node." -Level Warn
+    }
+    , @($ClusterName)
+}
+
+function Find-LatestFailover {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string[]]$Node,
+        [pscredential]$Credential,
+        [int]$LookbackDays = 7,
+        [int]$OpenTimeoutMs = 6000
+    )
+    $sb = {
+        param($days)
+        $start = (Get-Date).AddDays(-$days)
+        # Ownership/role-change + membership/quorum events that mark a failover.
+        $ids = 1135, 1146, 1069, 1177, 1201, 1205, 1206, 1635, 1641
+        try {
+            $e = Get-WinEvent -FilterHashtable @{
+                LogName      = 'System'
+                ProviderName = 'Microsoft-Windows-FailoverClustering'
+                StartTime    = $start
+            } -ErrorAction Stop | Where-Object { $ids -contains $_.Id } |
+                Sort-Object TimeCreated -Descending | Select-Object -First 1
+            if ($e) { $e.TimeCreated }
+        } catch { $null }
+    }
+
+    foreach ($n in $Node) {
+        try {
+            $opt = New-PSSessionOption -OpenTimeout $OpenTimeoutMs
+            $splat = @{
+                ComputerName  = $n
+                ScriptBlock   = $sb
+                ArgumentList  = $LookbackDays
+                SessionOption = $opt
+                ErrorAction   = 'Stop'
+            }
+            if ($Credential) { $splat.Credential = $Credential }
+            $t = Invoke-Command @splat
+            if ($t) {
+                Write-RcaLog "Find-LatestFailover: detected failover at $t (from $n)." -Level Info
+                return [datetime]$t
+            }
+        }
+        catch {
+            Write-RcaLog "Find-LatestFailover: '$n' query failed ($($_.Exception.Message))." -Level Debug
+            continue
+        }
+    }
+    $null
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Util\Write-RcaLog.ps1:
+<#
+    Internal diagnostic logging. Writes to the verbose stream and, if a run log path is
+    set in $script:RcaLogFile, appends a timestamped line. Never throws.
+#>
+
+function Write-RcaLog {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message,
+        [ValidateSet('Debug', 'Info', 'Warn', 'Error')]
+        [string]$Level = 'Info'
+    )
+    # Use UTC ISO-8601 for stable ordering across nodes in different time zones.
+    $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+    $line = "{0} [{1}] {2}" -f $stamp, $Level.ToUpper(), $Message
+
+    switch ($Level) {
+        'Warn'  { Write-Warning $Message }
+        'Error' { Write-Verbose $line }   # surfaced via findings/CollectionStatus, not thrown here
+        default { Write-Verbose $line }
+    }
+
+    if ($script:RcaLogFile) {
+        try { Add-Content -Path $script:RcaLogFile -Value $line -Encoding UTF8 -ErrorAction Stop }
+        catch { Write-Warning "RcaLog: could not write to $script:RcaLogFile ($($_.Exception.Message))" }
+    }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Public\Export-FailoverReport.ps1:
+<#
+.SYNOPSIS
+  Render an RcaResult to HTML and/or JSON.
+.DESCRIPTION
+  Stage 4. Separated from analysis so reports can be regenerated from a saved RcaResult
+  without re-touching the cluster. Returns the path(s) written.
+#>
+function Export-FailoverReport {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]$RcaResult,
+        [Parameter(Mandatory)][string]$OutputPath,
+        [ValidateSet('Html', 'Json', 'Both')]
+        [string]$Format = 'Both',
+        [switch]$OpenReport
+    )
+    process {
+        if (-not (Test-Path $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
+        $base = "RCA_$($RcaResult.ClusterName)"
+
+        $written = @()
+        if ($Format -in 'Html', 'Both') {
+            $written += New-HtmlReport -RcaResult $RcaResult -Path (Join-Path $OutputPath "$base.html")
+        }
+        if ($Format -in 'Json', 'Both') {
+            $written += New-JsonReport -RcaResult $RcaResult -Path (Join-Path $OutputPath "$base.json")
+        }
+
+        if ($OpenReport) {
+            $htmlOut = $written | Where-Object { $_ -like '*.html' } | Select-Object -First 1
+            if ($htmlOut) { try { Invoke-Item $htmlOut } catch { Write-RcaLog "Could not open report: $($_.Exception.Message)" -Level Warn } }
+        }
+        $written
+    }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Public\Get-FailoverEvidence.ps1:
+<#
+.SYNOPSIS
+  Run the collectors and return raw + normalized evidence (optionally persisted to disk).
+.DESCRIPTION
+  Stage 1 of the pipeline. Opens one throttled PSSession per node (reused across the four
+  Windows-side collectors), runs all six collectors for the time window, merges their events
+  into a single timeline, and returns the per-source CollectionStatus. The two SQL collectors
+  connect directly to each replica instance over TDS, so a reachable secondary is still
+  queried when the former primary is down. Sessions are always torn down on the way out.
+  -WhatIf walks the stages without opening sessions or performing collection/I-O.
+#>
+function Get-FailoverEvidence {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][string[]]$Node,
+        [string[]]$SqlInstance,
+        [datetime]$WindowStart,
+        [datetime]$WindowEnd,
+        [pscredential]$Credential,
+        [int]$ThrottleLimit = 4,
+        [string]$EvidencePath
+    )
+
+    Write-RcaLog "Collecting evidence from $($Node -join ', ') [$WindowStart -> $WindowEnd]" -Level Info
+
+    $sessions = @{}
+    $opened = $false
+    $results = @()
+    try {
+        if ($PSCmdlet.ShouldProcess(($Node -join ', '), 'Open remote sessions')) {
+            $opened = $true
+            foreach ($ns in (Connect-ClusterNode -Node $Node -Credential $Credential -ThrottleLimit $ThrottleLimit)) {
+                if ($ns.Connected) { $sessions[$ns.Node] = $ns.Session }
+            }
+        }
+
+        $winCommon = @{ Node = $Node; Session = $sessions; WindowStart = $WindowStart; WindowEnd = $WindowEnd; Credential = $Credential }
+        $sqlCommon = @{ Node = $Node; SqlInstance = $SqlInstance; WindowStart = $WindowStart; WindowEnd = $WindowEnd; Credential = $Credential }
+
+        if ($PSCmdlet.ShouldProcess(($Node -join ', '), 'Collect cluster.log'))     { $results += Get-ClusterLogData @winCommon }
+        if ($PSCmdlet.ShouldProcess(($Node -join ', '), 'Collect WSFC state'))       { $results += Get-WsfcStateData @winCommon }
+        if ($PSCmdlet.ShouldProcess(($Node -join ', '), 'Collect Windows events'))   { $results += Get-WindowsEventData @winCommon }
+        if ($PSCmdlet.ShouldProcess(($Node -join ', '), 'Collect node health'))      { $results += Get-NodeHealthData @winCommon }
+        if ($PSCmdlet.ShouldProcess(($Node -join ', '), 'Collect SQL ERRORLOG'))     { $results += Get-SqlErrorLogData @sqlCommon }
+        if ($PSCmdlet.ShouldProcess(($Node -join ', '), 'Collect SQL HA DMVs'))      { $results += Get-SqlHaDmvData @sqlCommon }
+    }
+    finally {
+        if ($opened) { Disconnect-ClusterNode -Node $Node }
+    }
+
+    $timeline = @($results | ConvertTo-TimelineEvent)
+    $status   = @($results | ForEach-Object { $_.Status })
+
+    if ($EvidencePath) {
+        if (-not (Test-Path $EvidencePath)) { New-Item -ItemType Directory -Path $EvidencePath -Force | Out-Null }
+        $evFile = Join-Path $EvidencePath 'evidence.json'
+        if ($PSCmdlet.ShouldProcess($evFile, 'Persist evidence')) {
+            [pscustomobject]@{ Timeline = $timeline; Status = $status } |
+                ConvertTo-Json -Depth 12 | Set-Content -Path $evFile -Encoding UTF8
+            Write-RcaLog "Persisted evidence: $evFile" -Level Info
+        }
+    }
+
+    [pscustomobject]@{
+        PSTypeName = 'Rca.Evidence'
+        Timeline   = $timeline
+        Status     = $status
+        Node       = $Node
+    }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Public\Get-FailoverRootCause.ps1:
+<#
+.SYNOPSIS
+  Run the rules engine over a timeline and return ranked root-cause findings.
+.DESCRIPTION
+  Stage 3. Thin public wrapper over Invoke-RuleEngine. Returns [Rca.RootCauseFinding[]]
+  ranked by confidence then severity.
+#>
+function Get-FailoverRootCause {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [AllowEmptyCollection()]
+        [object[]]$Timeline,
+
+        # Optional rule injection (testing); defaults to the Rules/ catalog.
+        [object[]]$Rule
+    )
+    begin { $acc = [System.Collections.Generic.List[object]]::new() }
+    process { foreach ($e in $Timeline) { $acc.Add($e) } }
+    end {
+        $params = @{ Timeline = $acc.ToArray() }
+        if ($PSBoundParameters.ContainsKey('Rule')) { $params.Rule = $Rule }
+        Invoke-RuleEngine @params
+    }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Public\Invoke-FailoverRCA.ps1:
+<#
+.SYNOPSIS
+  End-to-end failover root-cause analysis: collect -> timeline -> analyze -> report.
+.DESCRIPTION
+  Primary entry point (SPEC section 8). Resolves the node set and time window, runs the
+  collection -> normalize -> rules pipeline, builds an [Rca.RcaResult], selects the primary
+  (highest-confidence, non-planned) finding, writes HTML + JSON, and returns the result.
+
+  Phase 0: collectors are stubs, so a run completes and produces a valid (empty) report -
+  this proves the wiring. -WhatIf walks the pipeline without performing collection or I/O.
+.EXAMPLE
+  Invoke-FailoverRCA -ClusterName SQLCLU01 -OpenReport
+.EXAMPLE
+  Invoke-FailoverRCA -Node W19A,W19B -EventTime '2026-06-15 02:14' -OutputPath C:\RCA
+#>
+function Invoke-FailoverRCA {
+    [CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'Cluster')]
+    param(
+        [Parameter(Mandatory, ParameterSetName = 'Cluster')]
+        [string]$ClusterName,
+
+        [Parameter(Mandatory, ParameterSetName = 'Node')]
+        [string[]]$Node,
+
+        [string]$AvailabilityGroup,
+        [string[]]$SqlInstance,
+
+        # Center of the analysis window. If omitted, Phase 1 auto-detects the latest failover.
+        [datetime]$EventTime,
+        [timespan]$WindowBefore = (New-TimeSpan -Minutes 30),
+        [timespan]$WindowAfter  = (New-TimeSpan -Minutes 15),
+
+        [pscredential]$Credential,
+        [string]$OutputPath = (Join-Path (Get-Location) 'Output'),
+        [switch]$OpenReport
+    )
+
+    # --- Resolve node set ----------------------------------------------------
+    if ($PSCmdlet.ParameterSetName -eq 'Cluster') {
+        $clusterLabel = $ClusterName
+        if ($PSCmdlet.ShouldProcess($ClusterName, 'Resolve cluster member nodes')) {
+            $nodes = Resolve-ClusterNode -ClusterName $ClusterName -Credential $Credential
+        } else {
+            $nodes = @($ClusterName)
+        }
+    } else {
+        $nodes = $Node
+        $clusterLabel = ($Node -join '+')
+    }
+
+    # --- Resolve time window -------------------------------------------------
+    if (-not $PSBoundParameters.ContainsKey('EventTime')) {
+        $detected = $null
+        if ($PSCmdlet.ShouldProcess(($nodes -join ', '), 'Auto-detect most recent failover')) {
+            $detected = Find-LatestFailover -Node $nodes -Credential $Credential
+        }
+        if ($detected) {
+            $EventTime = $detected
+            Write-RcaLog "Auto-detected failover at $EventTime." -Level Info
+        } else {
+            $EventTime = Get-Date
+            Write-RcaLog "No -EventTime supplied and no failover auto-detected; centring the window on 'now'." -Level Warn
+        }
+    }
+    $windowStart = $EventTime - $WindowBefore
+    $windowEnd   = $EventTime + $WindowAfter
+
+    # --- Run output folder + run log -----------------------------------------
+    $runStamp = $EventTime.ToString('yyyyMMdd_HHmmss')
+    $runDir   = Join-Path $OutputPath "RCA_${clusterLabel}_${runStamp}"
+    if ($PSCmdlet.ShouldProcess($runDir, 'Create run output folder')) {
+        if (-not (Test-Path $runDir)) { New-Item -ItemType Directory -Path $runDir -Force | Out-Null }
+        $script:RcaLogFile = Join-Path $runDir 'run.log'
+    }
+    Write-RcaLog "=== Invoke-FailoverRCA: cluster='$clusterLabel' nodes='$($nodes -join ",")' window=[$windowStart -> $windowEnd] ===" -Level Info
+
+    # --- Pipeline ------------------------------------------------------------
+    $evParams = @{
+        Node = $nodes; SqlInstance = $SqlInstance
+        WindowStart = $windowStart; WindowEnd = $windowEnd
+        Credential = $Credential; EvidencePath = $runDir
+    }
+    $evidence = Get-FailoverEvidence @evParams
+
+    $timeline = @(New-FailoverTimeline -Evidence $evidence)
+    $findings = @(Get-FailoverRootCause -Timeline $timeline)
+
+    $result = New-RcaResult -ClusterName $clusterLabel -Nodes $nodes -AvailabilityGroup $AvailabilityGroup `
+        -EventTime $EventTime -WindowStart $windowStart -WindowEnd $windowEnd `
+        -Timeline $timeline -Findings $findings -CollectionStatus $evidence.Status -EvidencePath $runDir
+
+    # Primary = highest-confidence finding that is NOT a planned/administrative move.
+    $result.PrimaryFinding = $findings | Where-Object { -not $_.IsPlanned } | Select-Object -First 1
+
+    # --- Report --------------------------------------------------------------
+    if ($PSCmdlet.ShouldProcess($runDir, 'Write RCA report')) {
+        $reportParams = @{ RcaResult = $result; OutputPath = $runDir; Format = 'Both' }
+        if ($OpenReport) { $reportParams.OpenReport = $true }
+        Export-FailoverReport @reportParams | Out-Null
+    }
+
+    Write-RcaLog "=== Done. Findings: $($findings.Count). Output: $runDir ===" -Level Info
+    $result
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Public\New-FailoverTimeline.ps1:
+<#
+.SYNOPSIS
+  Build / inspect the unified timeline from evidence (live object or persisted JSON).
+.DESCRIPTION
+  Stage 2. Accepts the object returned by Get-FailoverEvidence, or a path to a persisted
+  evidence.json, and returns a time-ordered [Rca.TimelineEvent[]].
+#>
+function New-FailoverTimeline {
+    [CmdletBinding(DefaultParameterSetName = 'Object')]
+    param(
+        [Parameter(Mandatory, ParameterSetName = 'Object', ValueFromPipeline)]
+        $Evidence,
+
+        [Parameter(Mandatory, ParameterSetName = 'Path')]
+        [string]$EvidencePath
+    )
+    process {
+        if ($PSCmdlet.ParameterSetName -eq 'Path') {
+            $file = if (Test-Path $EvidencePath -PathType Container) { Join-Path $EvidencePath 'evidence.json' } else { $EvidencePath }
+            if (-not (Test-Path $file)) { throw "Evidence file not found: $file" }
+            $Evidence = Get-Content $file -Raw | ConvertFrom-Json
+        }
+
+        $events = if ($Evidence.PSObject.Properties['Timeline']) { $Evidence.Timeline } else { $Evidence }
+
+        @($events) | Sort-Object @{ Expression = { if ($_.Timestamp) { [datetime]$_.Timestamp } else { [datetime]::MaxValue } } }
+    }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Samples\New-SampleReport.ps1:
+<#
+    Generates Samples\sample-report.html from a synthetic but realistic scenario:
+    a storage I/O stall on the W19B primary starves sp_server_diagnostics, the AG lease
+    expires, and AG_OLTP fails over to W16. Demonstrates ranked findings (AG lease as the
+    primary verdict, storage as the contributing cause) and the filterable timeline.
+    Run:  .\Samples\New-SampleReport.ps1
+#>
+[CmdletBinding()]
+param([string]$OutFile = (Join-Path $PSScriptRoot 'sample-report.html'))
+
+Import-Module (Join-Path $PSScriptRoot '..\SqlFailoverClusterRCA.psd1') -Force
+$mod = Get-Module SqlFailoverClusterRCA
+
+& $mod {
+    param($OutFile)
+
+    $base = [datetime]'2026-06-15 02:14:00'
+    $tl = @(
+        New-TimelineEvent -Timestamp $base.AddSeconds(-95) -Node 'W19B' -Source 'SqlErrorLog' -Severity 'Error' -EventId '833' -Message 'I/O requests taking longer than 15 seconds to complete on file [F:\Data\OLTP.mdf] in database OLTP.'
+        New-TimelineEvent -Timestamp $base.AddSeconds(-58) -Node 'W19B' -Source 'WindowsEvent' -Severity 'Warning' -EventId '129' -Message 'Reset to device, \Device\RaidPort1, was issued.' -Data @{ Provider = 'storahci'; Log = 'System' }
+        New-TimelineEvent -Timestamp $base.AddSeconds(-30) -Node 'W19B' -Source 'NodeHealth' -Severity 'Warning' -Message 'Storage path latency elevated on F: (avg 480 ms over the last minute).' -Data @{ Kind = 'Disk' }
+        New-TimelineEvent -Timestamp $base.AddSeconds(-12) -Node 'W19B' -Source 'SqlErrorLog' -Severity 'Error' -EventId '19407' -Message 'The lease between availability group AG_OLTP and the Windows Server Failover Cluster has expired.'
+        New-TimelineEvent -Timestamp $base.AddSeconds(-8)  -Node 'W19B' -Source 'SqlErrorLog' -Severity 'Error' -EventId '19421' -Message 'Availability group health check timeout: sp_server_diagnostics did not return within HealthCheckTimeout.'
+        New-TimelineEvent -Timestamp $base.AddSeconds(-2)  -Node 'W19B' -Source 'ClusterLog' -Severity 'Error' -Message '[RES] SQL Server Availability Group <AG_OLTP>: lease renewal failed; resource is failing.'
+        New-TimelineEvent -Timestamp $base               -Node 'W19B' -Source 'ClusterLog' -Severity 'Warning' -Message '[RCM] moving group AG_OLTP from W19B to W16 (resource failure).'
+        New-TimelineEvent -Timestamp $base.AddSeconds(3)  -Node 'W16'  -Source 'WsfcState' -Severity 'Info' -Message "Group 'AG_OLTP' owner=W16 state=Online" -Data @{ Kind = 'Group' }
+        New-TimelineEvent -Timestamp $base.AddSeconds(5)  -Node 'W16'  -Source 'SqlHaDmv' -Severity 'Info' -Message "AG 'AG_OLTP' replica 'W16' role=PRIMARY health=HEALTHY connected=CONNECTED op=ONLINE" -Data @{ Kind = 'Replica' }
+        New-TimelineEvent -Timestamp $base.AddSeconds(5)  -Node 'W19B' -Source 'SqlHaDmv' -Severity 'Warning' -Message "AG 'AG_OLTP' replica 'W19B' role=RESOLVING health=NOT_HEALTHY connected=DISCONNECTED op=PENDING_FAILOVER" -Data @{ Kind = 'Replica' }
+        New-TimelineEvent -Timestamp $base.AddSeconds(9)  -Node 'W16'  -Source 'SqlErrorLog' -Severity 'Info' -Message 'The availability group database OLTP is changing roles from SECONDARY to PRIMARY because the mirroring session or availability group failed over.'
+    )
+
+    $findings = @(Get-FailoverRootCause -Timeline $tl)
+
+    $sources = 'ClusterLog', 'WsfcState', 'WindowsEvent', 'SqlErrorLog', 'SqlHaDmv', 'NodeHealth'
+    $status = foreach ($n in 'W16', 'W19B') {
+        foreach ($s in $sources) {
+            New-CollectionStatus -Node $n -Source $s -State 'Ok' -ItemCount (Get-Random -Min 3 -Max 60) -Detail 'collected'
+        }
+    }
+
+    $r = New-RcaResult -ClusterName 'SQLCLU01' -Nodes @('W16', 'W19B') -AvailabilityGroup 'AG_OLTP' `
+        -EventTime $base -WindowStart $base.AddMinutes(-30) -WindowEnd $base.AddMinutes(15) `
+        -Timeline $tl -Findings $findings -CollectionStatus @($status)
+    $r.PrimaryFinding = $findings | Where-Object { -not $_.IsPlanned } | Select-Object -First 1
+
+    New-HtmlReport -RcaResult $r -Path $OutFile | Out-Null
+} $OutFile
+
+Write-Host "Sample report written: $OutFile"
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Samples\sample-report.html:
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Failover RCA - SQLCLU01</title>
+<style>
+  :root{--ink:#1b1f23;--accent:#0b3d61}
+  *{box-sizing:border-box}
+  body{font-family:Segoe UI,Arial,sans-serif;margin:0;background:#f4f6f8;color:var(--ink)}
+  header{background:var(--accent);color:#fff;padding:18px 24px}
+  header h1{margin:0;font-size:20px} header .sub{opacity:.85;font-size:13px;margin-top:6px;line-height:1.6}
+  main{padding:20px 24px;max-width:1280px;margin:0 auto}
+  .verdict{background:#fff;border-left:6px solid var(--accent);padding:16px 18px;margin-bottom:20px;border-radius:4px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+  .verdict h2{margin:0 0 8px;font-size:13px;color:#64748b;font-weight:600;text-transform:uppercase;letter-spacing:.05em}
+  .verdict .v{font-size:19px;font-weight:600;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .verdict .conf{font-size:14px;color:#475569;font-weight:500}
+  .verdict .explain{margin:10px 0 6px;line-height:1.5}
+  .verdict .remediation{margin:6px 0;line-height:1.5}
+  details{margin-top:10px} summary{cursor:pointer;font-weight:600;color:#475569}
+  ul.evidence{margin:8px 0;padding-left:18px;font-size:13px;line-height:1.7} ul.evidence code{background:#eef2f6;padding:1px 5px;border-radius:3px}
+  section{background:#fff;padding:16px 18px;margin-bottom:18px;border-radius:4px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+  section h2{margin:0 0 12px;font-size:16px}
+  table{border-collapse:collapse;width:100%;font-size:13px}
+  th,td{border-bottom:1px solid #e2e8f0;padding:7px 9px;text-align:left;vertical-align:top}
+  th{background:#f1f5f9;font-weight:600;position:sticky;top:0}
+  .nowrap{white-space:nowrap} .muted{color:#94a3b8;font-style:italic}
+  .sev{padding:2px 9px;border-radius:10px;font-size:11px;font-weight:700;color:#fff;display:inline-block}
+  .sev-critical{background:#b91c1c} .sev-high{background:#c2410c} .sev-medium{background:#a16207} .sev-low{background:#64748b}
+  .tag{background:#e2e8f0;color:#475569;padding:1px 7px;border-radius:8px;font-size:10px;font-weight:700;text-transform:uppercase}
+  .confcell{white-space:nowrap} .confcell span{font-size:12px;margin-left:6px;color:#475569}
+  .bar{display:inline-block;width:90px;height:9px;background:#e2e8f0;border-radius:5px;overflow:hidden;vertical-align:middle}
+  .fill{height:100%} .fill-critical{background:#b91c1c} .fill-high{background:#c2410c} .fill-medium{background:#a16207} .fill-low{background:#64748b} .fill-none{background:#94a3b8}
+  .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;vertical-align:middle}
+  .dot-critical{background:#b91c1c} .dot-error{background:#c2410c} .dot-warning{background:#a16207} .dot-info{background:#94a3b8} .dot-none{background:#cbd5e1}
+  .state-ok{color:#15803d;font-weight:600} .state-partial{color:#a16207;font-weight:600} .state-failed{color:#b91c1c;font-weight:600} .state-skipped{color:#94a3b8}
+  .filters{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px;align-items:center}
+  .filters input,.filters select{padding:5px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:13px}
+  .filters input{flex:1;min-width:180px}
+  .count{font-size:12px;color:#64748b;margin-left:auto}
+</style></head><body>
+<header>
+  <h1>SQL Server Failover - Root-Cause Report</h1>
+  <div class="sub">
+    Cluster: <b>SQLCLU01</b> &nbsp;|&nbsp;
+    Nodes: W16, W19B &nbsp;|&nbsp;
+    AG: AG_OLTP &nbsp;|&nbsp;
+    Event time: 2026-06-15 02:14:00.000 &nbsp;|&nbsp;
+    Window: 2026-06-15 01:44:00.000 -> 2026-06-15 02:29:00.000
+  </div>
+</header>
+<main>
+  <div class="verdict"><h2>Verdict</h2>
+    <div class="v">AG lease / health timeout <span class="sev sev-high">High</span> <span class="conf">94% confidence</span></div>
+    <p class="explain">The AG lease expired or the health check timed out (SQL 19407/19421, or ERRORLOG lease / sp_server_diagnostics entries). The resource DLL stopped getting a healthy response from the primary instance within LeaseTimeout/HealthCheckTimeout and failed the AG over.</p>
+    <p class="remediation"><b>Recommended action:</b> Review HealthCheckTimeout/LeaseTimeout and FailureConditionLevel; investigate why sp_server_diagnostics stalled (CPU starvation, dump, non-yielding scheduler) on the primary. &nbsp;<a href="https://learn.microsoft.com/sql/database-engine/availability-groups/windows/availability-group-lease-healthcheck-timeout">[reference]</a></p>    <details open><summary>Evidence (3)</summary><ul class="evidence"><li><code>2026-06-15 02:13:48.000</code> &middot; <b>W19B</b> &middot; SqlErrorLog &middot; The lease between availability group AG_OLTP and the Windows Server Failover Cluster has expired.</li>
+<li><code>2026-06-15 02:13:52.000</code> &middot; <b>W19B</b> &middot; SqlErrorLog &middot; Availability group health check timeout: sp_server_diagnostics did not return within HealthCheckTimeout.</li>
+<li><code>2026-06-15 02:13:58.000</code> &middot; <b>W19B</b> &middot; ClusterLog &middot; [RES] SQL Server Availability Group &lt;AG_OLTP&gt;: lease renewal failed; resource is failing.</li></ul></details>
+  </div>
+
+  <section><h2>Ranked findings</h2>
+    <table><thead><tr><th>Severity</th><th>Confidence</th><th>Category</th><th>Explanation</th><th>Remediation</th></tr></thead>
+    <tbody>      <tr>
+        <td><span class="sev sev-high">High</span></td>
+        <td class="confcell"><div class="bar"><div class="fill fill-high" style="width:94%"></div></div><span>94%</span></td>
+        <td><b>AG lease / health timeout</b><br><span class="muted">AG-LEASE-TIMEOUT</span></td>
+        <td>The AG lease expired or the health check timed out (SQL 19407/19421, or ERRORLOG lease / sp_server_diagnostics entries). The resource DLL stopped getting a healthy response from the primary instance within LeaseTimeout/HealthCheckTimeout and failed the AG over.</td>
+        <td>Review HealthCheckTimeout/LeaseTimeout and FailureConditionLevel; investigate why sp_server_diagnostics stalled (CPU starvation, dump, non-yielding scheduler) on the primary. <a href="https://learn.microsoft.com/sql/database-engine/availability-groups/windows/availability-group-lease-healthcheck-timeout">KB</a></td>
+      </tr>
+      <tr>
+        <td><span class="sev sev-high">High</span></td>
+        <td class="confcell"><div class="bar"><div class="fill fill-high" style="width:78%"></div></div><span>78%</span></td>
+        <td><b>Cluster resource / RHS failure</b><br><span class="muted">RESOURCE-FAILURE</span></td>
+        <td>A clustered resource failed (Event 1069) or the Resource Hosting Subsystem terminated (Event 1146), or cluster.log shows an RHS/IsAlive failure. The group failed over because a resource in it could not stay online on the current owner.</td>
+        <td>A clustered resource failed its health check or the RHS hosting process terminated (Event 1069/1146). Identify the failing resource/DLL, review its IsAlive/LooksAlive and pending timeouts, and isolate it to its own RHS if it is crashing the monitor. <a href="https://learn.microsoft.com/windows-server/failover-clustering/troubleshooting-cluster-resource-failures">KB</a></td>
+      </tr>
+      <tr>
+        <td><span class="sev sev-high">High</span></td>
+        <td class="confcell"><div class="bar"><div class="fill fill-high" style="width:76%"></div></div><span>76%</span></td>
+        <td><b>Storage / I/O</b><br><span class="muted">STORAGE-IO-STALL</span></td>
+        <td>SQL reported I/O stalls (error 833 / &quot;I/O requests taking longer than 15s&quot;) and/or Windows logged disk resets/retries (Event 129/153). Stalled storage makes sp_server_diagnostics and the lease appear unhealthy, which can drive an AG/FCI failover.</td>
+        <td>Correlate SQL 833 I/O stalls with disk Event 129/153 and storage path latency; engage the storage team and check HBA/multipath/firmware. <a href="https://learn.microsoft.com/sql/relational-databases/errors-events/mssqlserver-833-database-engine-error">KB</a></td>
+      </tr></tbody></table>
+  </section>
+
+  <section><h2>Timeline <span class="muted">(11 events)</span></h2>
+    <div class="filters">
+      <input id="flt-text" type="text" placeholder="Filter by text...">
+      <select id="flt-source"><option value="">All sources</option><option value="ClusterLog">ClusterLog</option><option value="NodeHealth">NodeHealth</option><option value="SqlErrorLog">SqlErrorLog</option><option value="SqlHaDmv">SqlHaDmv</option><option value="WindowsEvent">WindowsEvent</option><option value="WsfcState">WsfcState</option></select>
+      <select id="flt-sev"><option value="">All severities</option><option value="Error">Error</option><option value="Info">Info</option><option value="Warning">Warning</option></select>
+      <select id="flt-node"><option value="">All nodes</option><option value="W16">W16</option><option value="W19B">W19B</option></select>
+      <span class="count">showing <b id="tl-count">0</b></span>
+    </div>
+    <table id="timeline"><thead><tr><th>Time</th><th>Node</th><th>Source</th><th>Severity</th><th>Event</th><th>Message</th></tr></thead>
+    <tbody>      <tr data-source="SqlErrorLog" data-sev="Error" data-node="W19B">
+        <td class="nowrap">2026-06-15 02:12:25.000</td>
+        <td>W19B</td>
+        <td>SqlErrorLog</td>
+        <td><span class="dot dot-error"></span>Error</td>
+        <td>833</td>
+        <td>I/O requests taking longer than 15 seconds to complete on file [F:\Data\OLTP.mdf] in database OLTP.</td>
+      </tr>
+      <tr data-source="WindowsEvent" data-sev="Warning" data-node="W19B">
+        <td class="nowrap">2026-06-15 02:13:02.000</td>
+        <td>W19B</td>
+        <td>WindowsEvent</td>
+        <td><span class="dot dot-warning"></span>Warning</td>
+        <td>129</td>
+        <td>Reset to device, \Device\RaidPort1, was issued.</td>
+      </tr>
+      <tr data-source="NodeHealth" data-sev="Warning" data-node="W19B">
+        <td class="nowrap">2026-06-15 02:13:30.000</td>
+        <td>W19B</td>
+        <td>NodeHealth</td>
+        <td><span class="dot dot-warning"></span>Warning</td>
+        <td></td>
+        <td>Storage path latency elevated on F: (avg 480 ms over the last minute).</td>
+      </tr>
+      <tr data-source="SqlErrorLog" data-sev="Error" data-node="W19B">
+        <td class="nowrap">2026-06-15 02:13:48.000</td>
+        <td>W19B</td>
+        <td>SqlErrorLog</td>
+        <td><span class="dot dot-error"></span>Error</td>
+        <td>19407</td>
+        <td>The lease between availability group AG_OLTP and the Windows Server Failover Cluster has expired.</td>
+      </tr>
+      <tr data-source="SqlErrorLog" data-sev="Error" data-node="W19B">
+        <td class="nowrap">2026-06-15 02:13:52.000</td>
+        <td>W19B</td>
+        <td>SqlErrorLog</td>
+        <td><span class="dot dot-error"></span>Error</td>
+        <td>19421</td>
+        <td>Availability group health check timeout: sp_server_diagnostics did not return within HealthCheckTimeout.</td>
+      </tr>
+      <tr data-source="ClusterLog" data-sev="Error" data-node="W19B">
+        <td class="nowrap">2026-06-15 02:13:58.000</td>
+        <td>W19B</td>
+        <td>ClusterLog</td>
+        <td><span class="dot dot-error"></span>Error</td>
+        <td></td>
+        <td>[RES] SQL Server Availability Group &lt;AG_OLTP&gt;: lease renewal failed; resource is failing.</td>
+      </tr>
+      <tr data-source="ClusterLog" data-sev="Warning" data-node="W19B">
+        <td class="nowrap">2026-06-15 02:14:00.000</td>
+        <td>W19B</td>
+        <td>ClusterLog</td>
+        <td><span class="dot dot-warning"></span>Warning</td>
+        <td></td>
+        <td>[RCM] moving group AG_OLTP from W19B to W16 (resource failure).</td>
+      </tr>
+      <tr data-source="WsfcState" data-sev="Info" data-node="W16">
+        <td class="nowrap">2026-06-15 02:14:03.000</td>
+        <td>W16</td>
+        <td>WsfcState</td>
+        <td><span class="dot dot-info"></span>Info</td>
+        <td></td>
+        <td>Group &#39;AG_OLTP&#39; owner=W16 state=Online</td>
+      </tr>
+      <tr data-source="SqlHaDmv" data-sev="Info" data-node="W16">
+        <td class="nowrap">2026-06-15 02:14:05.000</td>
+        <td>W16</td>
+        <td>SqlHaDmv</td>
+        <td><span class="dot dot-info"></span>Info</td>
+        <td></td>
+        <td>AG &#39;AG_OLTP&#39; replica &#39;W16&#39; role=PRIMARY health=HEALTHY connected=CONNECTED op=ONLINE</td>
+      </tr>
+      <tr data-source="SqlHaDmv" data-sev="Warning" data-node="W19B">
+        <td class="nowrap">2026-06-15 02:14:05.000</td>
+        <td>W19B</td>
+        <td>SqlHaDmv</td>
+        <td><span class="dot dot-warning"></span>Warning</td>
+        <td></td>
+        <td>AG &#39;AG_OLTP&#39; replica &#39;W19B&#39; role=RESOLVING health=NOT_HEALTHY connected=DISCONNECTED op=PENDING_FAILOVER</td>
+      </tr>
+      <tr data-source="SqlErrorLog" data-sev="Info" data-node="W16">
+        <td class="nowrap">2026-06-15 02:14:09.000</td>
+        <td>W16</td>
+        <td>SqlErrorLog</td>
+        <td><span class="dot dot-info"></span>Info</td>
+        <td></td>
+        <td>The availability group database OLTP is changing roles from SECONDARY to PRIMARY because the mirroring session or availability group failed over.</td>
+      </tr></tbody></table>
+  </section>
+
+  <section><h2>Collection status</h2>
+    <table><thead><tr><th>Node / Instance</th><th>Source</th><th>State</th><th>Items</th><th>Detail</th></tr></thead>
+    <tbody>      <tr>
+        <td>W16</td>
+        <td>ClusterLog</td>
+        <td class="state-ok">Ok</td>
+        <td>3</td>
+        <td>collected</td>
+      </tr>
+      <tr>
+        <td>W16</td>
+        <td>WsfcState</td>
+        <td class="state-ok">Ok</td>
+        <td>21</td>
+        <td>collected</td>
+      </tr>
+      <tr>
+        <td>W16</td>
+        <td>WindowsEvent</td>
+        <td class="state-ok">Ok</td>
+        <td>55</td>
+        <td>collected</td>
+      </tr>
+      <tr>
+        <td>W16</td>
+        <td>SqlErrorLog</td>
+        <td class="state-ok">Ok</td>
+        <td>58</td>
+        <td>collected</td>
+      </tr>
+      <tr>
+        <td>W16</td>
+        <td>SqlHaDmv</td>
+        <td class="state-ok">Ok</td>
+        <td>41</td>
+        <td>collected</td>
+      </tr>
+      <tr>
+        <td>W16</td>
+        <td>NodeHealth</td>
+        <td class="state-ok">Ok</td>
+        <td>25</td>
+        <td>collected</td>
+      </tr>
+      <tr>
+        <td>W19B</td>
+        <td>ClusterLog</td>
+        <td class="state-ok">Ok</td>
+        <td>18</td>
+        <td>collected</td>
+      </tr>
+      <tr>
+        <td>W19B</td>
+        <td>WsfcState</td>
+        <td class="state-ok">Ok</td>
+        <td>6</td>
+        <td>collected</td>
+      </tr>
+      <tr>
+        <td>W19B</td>
+        <td>WindowsEvent</td>
+        <td class="state-ok">Ok</td>
+        <td>29</td>
+        <td>collected</td>
+      </tr>
+      <tr>
+        <td>W19B</td>
+        <td>SqlErrorLog</td>
+        <td class="state-ok">Ok</td>
+        <td>13</td>
+        <td>collected</td>
+      </tr>
+      <tr>
+        <td>W19B</td>
+        <td>SqlHaDmv</td>
+        <td class="state-ok">Ok</td>
+        <td>33</td>
+        <td>collected</td>
+      </tr>
+      <tr>
+        <td>W19B</td>
+        <td>NodeHealth</td>
+        <td class="state-ok">Ok</td>
+        <td>38</td>
+        <td>collected</td>
+      </tr></tbody></table>
+  </section>
+
+  <p class="muted">Generated 2026-06-18 13:06:03 +10:00 by SqlFailoverClusterRCA.</p>
+</main>
+<script>
+(function(){
+  var rows = Array.prototype.slice.call(document.querySelectorAll('#timeline tbody tr'));
+  var q = document.getElementById('flt-text');
+  var fs = document.getElementById('flt-source');
+  var fv = document.getElementById('flt-sev');
+  var fn = document.getElementById('flt-node');
+  var counter = document.getElementById('tl-count');
+  function apply(){
+    var t = (q.value||'').toLowerCase();
+    var s = fs.value, v = fv.value, n = fn.value, shown = 0;
+    rows.forEach(function(r){
+      if(!r.getAttribute('data-source')){ return; }
+      var ok = (!s || r.getAttribute('data-source')===s)
+            && (!v || r.getAttribute('data-sev')===v)
+            && (!n || r.getAttribute('data-node')===n)
+            && (!t || r.textContent.toLowerCase().indexOf(t)>=0);
+      r.style.display = ok ? '' : 'none';
+      if(ok){ shown++; }
+    });
+    counter.textContent = shown;
+  }
+  [q,fs,fv,fn].forEach(function(el){ el.addEventListener('input', apply); el.addEventListener('change', apply); });
+  apply();
+})();
+</script>
+</body></html>
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Show-FailoverRcaGui.ps1:
+<#
+.SYNOPSIS
+  Windows (WPF) front-end for SqlFailoverClusterRCA. Enter a cluster or node(s), optionally a
+  SQL instance and a time, click Run - it calls Invoke-FailoverRCA, shows the verdict, and
+  opens the HTML report.
+.DESCRIPTION
+  Standalone launcher (not part of the module's exported surface). The analysis runs in a
+  background runspace so the window stays responsive; results are marshalled back to the UI
+  thread by a DispatcherTimer. Pure PowerShell + WPF - no install, no extra dependencies.
+.EXAMPLE
+  .\Show-FailoverRcaGui.ps1
+#>
+[CmdletBinding()]
+param(
+    # Build the window and validate wiring, then exit without showing it (for automated checks).
+    [switch]$SelfTest
+)
+
+# --- WPF needs an STA thread; relaunch ourselves under -STA if we are not on one. ----------
+if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+    $psExe = (Get-Process -Id $PID).Path
+    if (-not $psExe) { $psExe = 'powershell.exe' }
+    $fwd = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath)
+    if ($SelfTest) { $fwd += '-SelfTest' }
+    & $psExe @fwd @args
+    return
+}
+
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml, System.Windows.Forms
+
+$script:ModuleManifest = Join-Path $PSScriptRoot 'SqlFailoverClusterRCA.psd1'
+if (-not (Test-Path $script:ModuleManifest)) {
+    [System.Windows.MessageBox]::Show("Cannot find SqlFailoverClusterRCA.psd1 next to this script.", 'SQL Failover RCA', 'OK', 'Error') | Out-Null
+    return
+}
+
+# --- UI definition --------------------------------------------------------------------------
+$xaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="SQL Failover RCA" Height="560" Width="560" WindowStartupLocation="CenterScreen"
+        FontFamily="Segoe UI" FontSize="13" Background="#F4F6F8">
+  <Grid Margin="16">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/><RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+
+    <TextBlock Grid.Row="0" Text="SQL Server Failover - Root Cause Analysis" FontSize="18" FontWeight="SemiBold" Foreground="#0B3D61" Margin="0,0,0,12"/>
+
+    <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,6">
+      <RadioButton x:Name="rbNode" Content="Node(s)" IsChecked="True" Margin="0,0,18,0" VerticalAlignment="Center"/>
+      <RadioButton x:Name="rbCluster" Content="Cluster name" VerticalAlignment="Center"/>
+    </StackPanel>
+    <TextBox x:Name="txtTarget" Grid.Row="2" Margin="0,0,0,8" Padding="4" ToolTip="Comma-separated node names, or a single cluster name."/>
+
+    <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,0,0,8">
+      <TextBlock Text="SQL instance(s):" Width="110" VerticalAlignment="Center"/>
+      <TextBox x:Name="txtSql" Width="380" Padding="4" ToolTip="Optional. Comma-separated. Defaults to a default instance per node."/>
+    </StackPanel>
+
+    <CheckBox x:Name="chkAuto" Grid.Row="4" Content="Auto-detect the most recent failover (ignore the time below)" IsChecked="True" Margin="0,0,0,8"/>
+
+    <StackPanel Grid.Row="5" Orientation="Horizontal" Margin="0,0,0,8">
+      <TextBlock Text="Event time:" Width="110" VerticalAlignment="Center"/>
+      <DatePicker x:Name="dpDate" Width="150" IsEnabled="False"/>
+      <TextBox x:Name="txtTime" Width="80" Margin="8,0,0,0" Padding="4" Text="00:00" IsEnabled="False" ToolTip="HH:mm (24h)"/>
+      <TextBlock Text="  window  -" VerticalAlignment="Center" Margin="12,0,0,0"/>
+      <TextBox x:Name="txtBefore" Width="44" Margin="4,0,0,0" Padding="4" Text="30"/>
+      <TextBlock Text="min ... +" VerticalAlignment="Center" Margin="4,0,0,0"/>
+      <TextBox x:Name="txtAfter" Width="44" Margin="4,0,0,0" Padding="4" Text="15"/>
+      <TextBlock Text="min" VerticalAlignment="Center" Margin="4,0,0,0"/>
+    </StackPanel>
+
+    <StackPanel Grid.Row="6" Orientation="Horizontal" Margin="0,0,0,8">
+      <TextBlock Text="Output folder:" Width="110" VerticalAlignment="Center"/>
+      <TextBox x:Name="txtOut" Width="320" Padding="4"/>
+      <Button x:Name="btnBrowse" Content="..." Width="32" Margin="6,0,0,0"/>
+    </StackPanel>
+
+    <StackPanel Grid.Row="7" Orientation="Horizontal" Margin="0,0,0,10">
+      <CheckBox x:Name="chkCred" Content="Use alternate credentials" Margin="0,0,24,0"/>
+      <CheckBox x:Name="chkOpen" Content="Open report when done" IsChecked="True"/>
+    </StackPanel>
+
+    <StackPanel Grid.Row="8" Orientation="Horizontal" Margin="0,0,0,8">
+      <Button x:Name="btnRun" Content="Run analysis" Width="130" Height="32" Background="#0B3D61" Foreground="White" FontWeight="SemiBold"/>
+      <ProgressBar x:Name="pb" Width="160" Height="14" Margin="14,0,0,0" IsIndeterminate="True" Visibility="Collapsed" VerticalAlignment="Center"/>
+      <TextBlock x:Name="txtStatus" Text="Idle." Margin="14,0,0,0" VerticalAlignment="Center" Foreground="#475569"/>
+    </StackPanel>
+
+    <Border Grid.Row="9" Background="White" BorderBrush="#E2E8F0" BorderThickness="1" CornerRadius="4" Padding="10" Margin="0,0,0,8">
+      <StackPanel>
+        <TextBlock Text="VERDICT" FontSize="11" Foreground="#64748B" FontWeight="SemiBold"/>
+        <TextBlock x:Name="txtVerdict" Text="--" FontSize="15" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,4,0,8"/>
+        <TextBox x:Name="txtFindings" IsReadOnly="True" BorderThickness="0" Background="Transparent" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" Height="120"/>
+      </StackPanel>
+    </Border>
+
+    <StackPanel Grid.Row="10" Orientation="Horizontal" HorizontalAlignment="Right">
+      <Button x:Name="btnOpenFolder" Content="Open output folder" Width="150" Height="28" IsEnabled="False"/>
+    </StackPanel>
+  </Grid>
+</Window>
+'@
+
+$reader = New-Object System.Xml.XmlNodeReader ([xml]$xaml)
+$win = [System.Windows.Markup.XamlReader]::Load($reader)
+
+# Resolve controls.
+$ctl = @{}
+foreach ($n in 'rbNode','rbCluster','txtTarget','txtSql','chkAuto','dpDate','txtTime','txtBefore','txtAfter','txtOut','btnBrowse','chkCred','chkOpen','btnRun','pb','txtStatus','txtVerdict','txtFindings','btnOpenFolder') {
+    $ctl[$n] = $win.FindName($n)
+}
+
+# Defaults.
+$ctl.txtOut.Text = Join-Path $PSScriptRoot 'Output'
+$ctl.dpDate.SelectedDate = [datetime]::Today
+
+# Run state (script scope so the timer/handlers can share it).
+$script:psInst = $null
+$script:async  = $null
+$script:timer  = $null
+$script:lastDir = $null
+
+# --- Helpers --------------------------------------------------------------------------------
+function Set-RunningState {
+    param([bool]$Running)
+    $ctl.btnRun.IsEnabled = -not $Running
+    $ctl.pb.Visibility = if ($Running) { 'Visible' } else { 'Collapsed' }
+}
+
+# --- Event wiring ---------------------------------------------------------------------------
+$toggleTime = {
+    $manual = -not $ctl.chkAuto.IsChecked
+    $ctl.dpDate.IsEnabled = $manual
+    $ctl.txtTime.IsEnabled = $manual
+}.GetNewClosure()
+$ctl.chkAuto.Add_Checked($toggleTime)
+$ctl.chkAuto.Add_Unchecked($toggleTime)
+
+$ctl.btnBrowse.Add_Click({
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    if ($ctl.txtOut.Text -and (Test-Path $ctl.txtOut.Text)) { $dlg.SelectedPath = $ctl.txtOut.Text }
+    if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $ctl.txtOut.Text = $dlg.SelectedPath }
+}.GetNewClosure())
+
+$ctl.btnOpenFolder.Add_Click({
+    if ($script:lastDir -and (Test-Path $script:lastDir)) { Invoke-Item $script:lastDir }
+}.GetNewClosure())
+
+$ctl.btnRun.Add_Click({
+    # --- Gather + validate -------------------------------------------------
+    $target = ($ctl.txtTarget.Text).Trim()
+    if (-not $target) {
+        [System.Windows.MessageBox]::Show('Enter a cluster name or one or more node names.', 'SQL Failover RCA', 'OK', 'Warning') | Out-Null
+        return
+    }
+
+    $params = @{ OutputPath = $ctl.txtOut.Text }
+    if ($ctl.rbCluster.IsChecked) {
+        $params.ClusterName = $target
+    } else {
+        $params.Node = @($target -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    }
+    if ($ctl.txtSql.Text.Trim()) {
+        $params.SqlInstance = @($ctl.txtSql.Text -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    }
+
+    if (-not $ctl.chkAuto.IsChecked) {
+        if (-not $ctl.dpDate.SelectedDate) {
+            [System.Windows.MessageBox]::Show('Pick an event date, or tick auto-detect.', 'SQL Failover RCA', 'OK', 'Warning') | Out-Null
+            return
+        }
+        $t = [datetime]::Today
+        if (-not [datetime]::TryParse($ctl.dpDate.SelectedDate.ToString('yyyy-MM-dd') + ' ' + $ctl.txtTime.Text, [ref]$t)) {
+            [System.Windows.MessageBox]::Show('Time must be HH:mm (24-hour).', 'SQL Failover RCA', 'OK', 'Warning') | Out-Null
+            return
+        }
+        $params.EventTime = $t
+    }
+
+    $b = 30; $a = 15
+    [void][int]::TryParse($ctl.txtBefore.Text, [ref]$b)
+    [void][int]::TryParse($ctl.txtAfter.Text,  [ref]$a)
+    $params.WindowBefore = (New-TimeSpan -Minutes $b)
+    $params.WindowAfter  = (New-TimeSpan -Minutes $a)
+
+    if ($ctl.chkOpen.IsChecked) { $params.OpenReport = $true }
+
+    if ($ctl.chkCred.IsChecked) {
+        $cred = Get-Credential -Message 'Credentials for the target node(s)'
+        if ($cred) { $params.Credential = $cred }
+    }
+
+    # --- Launch in a background runspace -----------------------------------
+    Set-RunningState $true
+    $ctl.txtStatus.Text = 'Running analysis...'
+    $ctl.txtVerdict.Text = '--'
+    $ctl.txtFindings.Text = ''
+    $ctl.btnOpenFolder.IsEnabled = $false
+
+    $script:psInst = [powershell]::Create()
+    [void]$script:psInst.AddScript({
+        param($manifest, $p)
+        Import-Module $manifest -Force
+        Invoke-FailoverRCA @p
+    }).AddArgument($script:ModuleManifest).AddArgument($params)
+    $script:async = $script:psInst.BeginInvoke()
+
+    $script:timer = New-Object System.Windows.Threading.DispatcherTimer
+    $script:timer.Interval = [TimeSpan]::FromMilliseconds(300)
+    $script:timer.Add_Tick({
+        if (-not $script:async.IsCompleted) { return }
+        $script:timer.Stop()
+        $result = $null; $err = $null
+        try { $result = @($script:psInst.EndInvoke($script:async)) | Select-Object -Last 1 }
+        catch { $err = $_.Exception.Message }
+        finally { $script:psInst.Dispose() }
+
+        Set-RunningState $false
+        if ($err) {
+            $ctl.txtStatus.Text = 'Failed.'
+            $ctl.txtVerdict.Text = $err
+            $ctl.txtVerdict.Foreground = [System.Windows.Media.Brushes]::Firebrick
+            return
+        }
+
+        $script:lastDir = $result.EvidencePath
+        $ctl.btnOpenFolder.IsEnabled = [bool]($script:lastDir -and (Test-Path $script:lastDir))
+        $ctl.txtStatus.Text = "Done. $(@($result.Findings).Count) finding(s)."
+
+        $pf = $result.PrimaryFinding
+        if ($pf) {
+            $ctl.txtVerdict.Text = "$($pf.Category)  -  $($pf.Confidence)% ($($pf.Severity))"
+            $brush = switch ($pf.Severity) {
+                'Critical' { 'Firebrick' } 'High' { 'Chocolate' } 'Medium' { 'DarkGoldenrod' } default { 'SlateGray' }
+            }
+            $ctl.txtVerdict.Foreground = [System.Windows.Media.Brushes].GetProperty($brush).GetValue($null)
+        } else {
+            $ctl.txtVerdict.Text = 'No fault root cause identified for this window.'
+            $ctl.txtVerdict.Foreground = [System.Windows.Media.Brushes]::SlateGray
+        }
+
+        $lines = foreach ($f in @($result.Findings)) {
+            "[{0,3}%] {1,-8} {2}{3}" -f $f.Confidence, $f.Severity, $f.Category, $(if ($f.IsPlanned) { ' (planned)' } else { '' })
+        }
+        $ctl.txtFindings.Text = ($lines -join "`r`n")
+    }.GetNewClosure())
+    $script:timer.Start()
+}.GetNewClosure())
+
+# --- Self-test path (no window shown) -------------------------------------------------------
+if ($SelfTest) {
+    $missing = @($ctl.GetEnumerator() | Where-Object { $null -eq $_.Value } | ForEach-Object { $_.Key })
+    Import-Module $script:ModuleManifest -Force
+    $hasEngine = [bool](Get-Command Invoke-FailoverRCA -ErrorAction SilentlyContinue)
+    if ($missing.Count)   { Write-Output "SELFTEST FAIL: unresolved controls -> $($missing -join ', ')" }
+    elseif (-not $hasEngine) { Write-Output 'SELFTEST FAIL: Invoke-FailoverRCA not found.' }
+    else { Write-Output "SELFTEST OK: window built; $($ctl.Count) controls resolved; engine present." }
+    return
+}
+
+# --- Show -----------------------------------------------------------------------------------
+[void]$win.ShowDialog()
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\SQL Failover RCA.cmd:
+@echo off
+REM ============================================================================
+REM  Double-click launcher for the SQL Failover RCA GUI.
+REM  Starts PowerShell hidden (no console window) on an STA thread and opens the
+REM  WPF window. %~dp0 = this file's folder, so it works from any location.
+REM ============================================================================
+start "" powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0Show-FailoverRcaGui.ps1" %*
+exit /b
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\SqlFailoverClusterRCA.psd1:
+@{
+    RootModule        = 'SqlFailoverClusterRCA.psm1'
+    ModuleVersion     = '0.3.0'
+    GUID              = 'b6f2a4d1-3c8e-4a91-9f7d-2e5c1a8b4f30'
+    Author            = 'Al Elmi'
+    CompanyName       = 'Al Elmi'
+    Copyright         = '(c) 2026 Al Elmi. All rights reserved.'
+    Description       = 'Root-cause analyzer for SQL Server failovers (Always On AG and FCI) across WSFC nodes. Read-only, agentless. See SPEC.md.'
+    PowerShellVersion = '5.1'
+
+    FunctionsToExport = @(
+        'Invoke-FailoverRCA',
+        'Get-FailoverEvidence',
+        'New-FailoverTimeline',
+        'Get-FailoverRootCause',
+        'Export-FailoverReport'
+    )
+    CmdletsToExport   = @()
+    VariablesToExport = @()
+    AliasesToExport   = @()
+
+    PrivateData = @{
+        PSData = @{
+            Tags         = @('SQLServer', 'AlwaysOn', 'FCI', 'WSFC', 'FailoverCluster', 'RCA', 'DBA')
+            ProjectUri   = ''
+            ReleaseNotes = 'Phase 1-4: real collectors (cluster.log, WSFC state, Windows events, SQL ERRORLOG, SQL HA DMVs, node health), throttled PSSessions with local in-process execution, direct-to-replica SQL over TDS, merged timeline, data-driven rules engine with confidence/severity ranking, and a self-contained HTML report (verdict + evidence chain, confidence bars, filterable color-coded timeline) plus JSON. Functional against live nodes; lab hardening continues in Phase 5.'
+        }
+    }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\SqlFailoverClusterRCA.psm1:
+<#
+    SqlFailoverClusterRCA — root module.
+    Dot-sources Private/ then Public/ scripts. Only Public/* functions are exported
+    (per the manifest's FunctionsToExport). Data shapes are PSCustomObjects with a
+    PSTypeName (see Private/Types.ps1) to avoid PowerShell class load-order issues.
+#>
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$script:ModuleRoot = $PSScriptRoot
+$script:RcaLogFile = $null   # set per-run by Invoke-FailoverRCA; null = verbose-only logging
+
+# Module-scoped caches (populated lazily by the helpers in Private\Util).
+$script:RcaSessions    = @{}     # node -> open PSSession (see Connect-ClusterNode)
+$script:RcaEventMap    = $null   # Data\eventid.map.json (see Get-RcaData)
+$script:RcaRuleCatalog = $null   # Data\rules.catalog.json (see Get-RcaData)
+
+# Order matters: Types and shared helpers first (other files depend on their factories/
+# helpers, and the Rules/*.ps1 files call Get-RcaRuleMeta/Get-RcaConfidence at load time).
+$loadOrder = @(
+    'Private\Types.ps1'
+    'Private\Util\Write-RcaLog.ps1'
+    'Private\Util\Get-RcaData.ps1'
+    'Private\Util\Invoke-RcaRemote.ps1'
+    'Private\Util\Connect-ClusterNode.ps1'
+    'Private\Util\Invoke-SqlReadOnly.ps1'
+)
+
+$loaded = [System.Collections.Generic.HashSet[string]]::new()
+foreach ($rel in $loadOrder) {
+    $p = Join-Path $script:ModuleRoot $rel
+    if (Test-Path $p) { . $p; [void]$loaded.Add($p) }
+}
+
+# Then everything else under Private/ and Public/.
+foreach ($folder in @('Private', 'Public')) {
+    $base = Join-Path $script:ModuleRoot $folder
+    if (-not (Test-Path $base)) { continue }
+    Get-ChildItem -Path $base -Recurse -Filter '*.ps1' -File |
+        Where-Object { -not $loaded.Contains($_.FullName) -and $_.Name -notlike '*.Tests.ps1' } |
+        ForEach-Object { . $_.FullName }
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Tests\Unit\Scaffold.Tests.ps1:
+#requires -Modules Pester
+<#
+    Unit tests - prove the pipeline wiring, the read-only SQL guard, and the rule engine
+    (both with injected rules and against the real Data\rules.catalog.json). The end-to-end
+    test runs against unreachable placeholder nodes to prove the collectors degrade
+    gracefully (status 'Failed', never throwing) and still produce a valid report.
+    Run:  .\Invoke-Tests.ps1   (or)   Invoke-Pester -Path .\Tests\Unit
+#>
+
+BeforeAll {
+    $script:ModulePath = Join-Path $PSScriptRoot '..\..\SqlFailoverClusterRCA.psd1' | Resolve-Path
+    Import-Module $script:ModulePath -Force
+    $script:OutDir = Join-Path ([System.IO.Path]::GetTempPath()) ("rca_test_" + [guid]::NewGuid().ToString('N'))
+}
+
+AfterAll {
+    if (Test-Path $script:OutDir) { Remove-Item $script:OutDir -Recurse -Force -ErrorAction SilentlyContinue }
+    Remove-Module SqlFailoverClusterRCA -Force -ErrorAction SilentlyContinue
+}
+
+Describe 'Module surface' {
+    It 'exports exactly the five public cmdlets' {
+        $expected = 'Invoke-FailoverRCA', 'Get-FailoverEvidence', 'New-FailoverTimeline', 'Get-FailoverRootCause', 'Export-FailoverReport'
+        $actual = (Get-Command -Module SqlFailoverClusterRCA -CommandType Function).Name
+        ($actual | Sort-Object) | Should -Be ($expected | Sort-Object)
+    }
+}
+
+Describe 'Type factories' {
+    It 'New-TimelineEvent tags the shape' {
+        $e = & (Get-Module SqlFailoverClusterRCA) { New-TimelineEvent -Timestamp (Get-Date) -Node 'W19A' -Source 'ClusterLog' -Message 'x' }
+        $e.PSTypeNames | Should -Contain 'Rca.TimelineEvent'
+    }
+    It 'New-RcaResult defaults to empty collections' {
+        $r = & (Get-Module SqlFailoverClusterRCA) { New-RcaResult -ClusterName 'C1' }
+        $r.Findings | Should -BeNullOrEmpty
+        $r.PrimaryFinding | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Read-only SQL guard' {
+    It 'permits a SELECT / DMV read' {
+        & (Get-Module SqlFailoverClusterRCA) { Test-RcaReadOnlySql 'SELECT * FROM sys.dm_hadr_availability_replica_states' } | Should -BeTrue
+    }
+    It 'permits an allowlisted read proc (xp_readerrorlog)' {
+        & (Get-Module SqlFailoverClusterRCA) { Test-RcaReadOnlySql 'EXEC xp_readerrorlog 0, 1' } | Should -BeTrue
+    }
+    It 'still blocks a write piggy-backed after an allowed proc' {
+        & (Get-Module SqlFailoverClusterRCA) { Test-RcaReadOnlySql 'EXEC xp_readerrorlog 0; DROP TABLE foo' } | Should -BeFalse
+    }
+    It 'refuses a write statement before connecting' {
+        { & (Get-Module SqlFailoverClusterRCA) { Invoke-SqlReadOnly -ServerInstance 'x' -Query 'DROP TABLE foo' } } | Should -Throw
+    }
+    It 'ValidateOnly lets a read-only query pass without a connection' {
+        { & (Get-Module SqlFailoverClusterRCA) { Invoke-SqlReadOnly -ServerInstance 'x' -Query 'SELECT 1' -ValidateOnly } } | Should -Not -Throw
+    }
+}
+
+Describe 'Rule engine (injected rules)' {
+    It 'ranks fired rules by confidence then severity, and skips non-matching rules' {
+        $tl = @(
+            & (Get-Module SqlFailoverClusterRCA) { New-TimelineEvent -Timestamp (Get-Date) -Node 'W19A' -Source 'SqlErrorLog' -Severity 'Error' -Message 'lease timeout' }
+        )
+        $rules = @(
+            @{ Id = 'HIT-HI'; Category = 'AG lease / health timeout'; Severity = 'High'
+               Match = { param($t) $t | Where-Object { $_.Message -match 'lease' } }
+               Confidence = { param($m, $t) 80 }; Explain = 'e'; Remediation = 'r' }
+            @{ Id = 'HIT-LO'; Category = 'Network heartbeat'; Severity = 'Medium'
+               Match = { param($t) $t }
+               Confidence = { param($m, $t) 40 }; Explain = 'e'; Remediation = 'r' }
+            @{ Id = 'MISS'; Category = 'Storage / I/O'; Severity = 'Critical'
+               Match = { param($t) $t | Where-Object { $_.Message -match 'NOPE' } }
+               Confidence = { param($m, $t) 99 }; Explain = 'e'; Remediation = 'r' }
+        )
+        $findings = Get-FailoverRootCause -Timeline $tl -Rule $rules
+        $findings.Count | Should -Be 2
+        $findings[0].RuleId | Should -Be 'HIT-HI'   # 80 > 40, MISS did not fire
+    }
+}
+
+Describe 'Rule engine (real catalog rules)' {
+    BeforeAll {
+        function script:New-Tl {
+            param($Source, $Severity, $EventId, $Message)
+            & (Get-Module SqlFailoverClusterRCA) {
+                param($s, $sev, $id, $msg)
+                New-TimelineEvent -Timestamp (Get-Date) -Node 'W19A' -Source $s -Severity $sev -EventId $id -Message $msg
+            } -s $Source -sev $Severity -id $EventId -msg $Message
+        }
+    }
+
+    It 'flags a node crash from a bugcheck event' {
+        $tl = @(New-Tl 'WindowsEvent' 'Critical' '1001' 'The computer has rebooted from a bugcheck.')
+        $f = Get-FailoverRootCause -Timeline $tl
+        $f[0].RuleId | Should -Be 'NODE-CRASH-BUGCHECK'
+        $f[0].Severity | Should -Be 'Critical'   # enriched from the catalog
+        $f[0].IsPlanned | Should -BeFalse
+    }
+    It 'flags an AG lease/health-check timeout' {
+        $tl = @(New-Tl 'SqlErrorLog' 'Error' '19421' 'Availability group health check timeout.')
+        $f = Get-FailoverRootCause -Timeline $tl
+        ($f.RuleId) | Should -Contain 'AG-LEASE-TIMEOUT'
+    }
+    It 'marks an administrative move as planned (no fault)' {
+        $tl = @(New-Tl 'ClusterLog' 'Info' $null 'Move-ClusterGroup initiated by administrator')
+        $f = Get-FailoverRootCause -Timeline $tl
+        ($f | Where-Object { $_.RuleId -eq 'PLANNED-MOVE' }).IsPlanned | Should -BeTrue
+    }
+}
+
+Describe 'Normalizer' {
+    It 'merges Events from collector hashtables and sorts chronologically' {
+        $merged = & (Get-Module SqlFailoverClusterRCA) {
+            $e1 = New-TimelineEvent -Timestamp (Get-Date) -Node 'W19A' -Source 'WindowsEvent' -EventId '1001' -Message 'a'
+            $e2 = New-TimelineEvent -Timestamp (Get-Date).AddMinutes(-5) -Node 'W19B' -Source 'SqlErrorLog' -Message 'b'
+            @(@{ Events = @($e1); Status = @() }, @{ Events = @($e2); Status = @() }) | ConvertTo-TimelineEvent
+        }
+        $merged.Count | Should -Be 2          # guards the hashtable-key merge regression
+        $merged[0].Node | Should -Be 'W19B'   # earlier timestamp sorts first
+    }
+}
+
+Describe 'End-to-end pipeline (unreachable placeholder nodes)' {
+    It 'Invoke-FailoverRCA -WhatIf runs without opening sessions or performing I/O' {
+        { Invoke-FailoverRCA -Node 'W19A', 'W19B' -EventTime '2026-06-15 02:14' -OutputPath $script:OutDir -WhatIf } | Should -Not -Throw
+    }
+
+    It 'a real run degrades gracefully and still writes a valid HTML + JSON report' {
+        $r = Invoke-FailoverRCA -Node 'W19A', 'W19B' -EventTime '2026-06-15 02:14' -OutputPath $script:OutDir
+        $r.PSTypeNames | Should -Contain 'Rca.RcaResult'
+        $r.Nodes | Should -Be @('W19A', 'W19B')
+        # Six sources x two nodes/instances = 12 collection-status rows.
+        $r.CollectionStatus.Count | Should -Be 12
+        # Unreachable nodes => collectors record a status and never throw.
+        $r.CollectionStatus.State | ForEach-Object { $_ | Should -BeIn @('Ok', 'Partial', 'Failed', 'Skipped') }
+
+        $html = Get-ChildItem -Path $script:OutDir -Recurse -Filter '*.html'
+        $json = Get-ChildItem -Path $script:OutDir -Recurse -Filter 'RCA_*.json'
+        $html | Should -Not -BeNullOrEmpty
+        $json | Should -Not -BeNullOrEmpty
+    }
+}
