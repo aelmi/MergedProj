@@ -1,4 +1,4 @@
-C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Data\eventid.map.json:
+ C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Data\eventid.map.json:
 {
   "$comment": "Windows/SQL event-id → meaning lookup used by collectors/normalizer. Phase 0 seed; expand in Phase 1.",
   "schemaVersion": 1,
@@ -971,6 +971,11 @@ function New-HtmlReport {
     }
     if (-not $statusRows) { $statusRows = '<tr><td colspan="5" class="muted">No collection status.</td></tr>' }
 
+    # --- Email-ready narratives (rendered as HTML fragments) ----------------
+    $emailShort   = New-RcaNarrative -RcaResult $RcaResult -Mode Short   -As Html
+    $emailNormal  = New-RcaNarrative -RcaResult $RcaResult -Mode Normal  -As Html
+    $emailVerbose = New-RcaNarrative -RcaResult $RcaResult -Mode Verbose -As Html
+
     $genStamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz')
 
     $html = @"
@@ -1011,6 +1016,13 @@ function New-HtmlReport {
   .filters input,.filters select{padding:5px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:13px}
   .filters input{flex:1;min-width:180px}
   .count{font-size:12px;color:#64748b;margin-left:auto}
+  .emailbar{display:flex;gap:6px;align-items:center;margin-bottom:10px}
+  .emailbar button{padding:5px 12px;border:1px solid #cbd5e1;background:#f8fafc;border-radius:4px;cursor:pointer;font-size:13px}
+  .emailbar button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .emailbar .copybtn{margin-left:auto;font-weight:600}
+  .emailbar .copied{color:#15803d;font-size:12px;font-weight:600}
+  .emailbox{border:1px solid #e2e8f0;border-radius:4px;padding:12px 16px;background:#fff;line-height:1.55}
+  .emailbox p{margin:0 0 10px} .emailbox ul{margin:0 0 10px;padding-left:20px} .emailbox li{margin:2px 0}
 </style></head><body>
 <header>
   <h1>SQL Server Failover - Root-Cause Report</h1>
@@ -1030,6 +1042,20 @@ $verdictHtml
   <section><h2>Ranked findings</h2>
     <table><thead><tr><th>Severity</th><th>Confidence</th><th>Category</th><th>Explanation</th><th>Remediation</th></tr></thead>
     <tbody>$($findingRows -join "`n")</tbody></table>
+  </section>
+
+  <section><h2>Email-ready summary</h2>
+    <div class="emailbar">
+      <button data-mode="short" onclick="rcaEmailTab('short')">Short</button>
+      <button data-mode="normal" class="active" onclick="rcaEmailTab('normal')">Normal</button>
+      <button data-mode="verbose" onclick="rcaEmailTab('verbose')">Verbose</button>
+      <button class="copybtn" onclick="rcaEmailCopy()">Copy to clipboard</button>
+      <span id="email-copied" class="copied"></span>
+    </div>
+    <div id="email-short" class="emailbox" style="display:none">$emailShort</div>
+    <div id="email-normal" class="emailbox">$emailNormal</div>
+    <div id="email-verbose" class="emailbox" style="display:none">$emailVerbose</div>
+    <p class="muted" style="margin-top:8px">Tip: pick a length, click Copy, then paste into Outlook - the formatting is preserved.</p>
   </section>
 
   <section><h2>Timeline <span class="muted">($($tl.Count) events)</span></h2>
@@ -1076,6 +1102,29 @@ $verdictHtml
   [q,fs,fv,fn].forEach(function(el){ el.addEventListener('input', apply); el.addEventListener('change', apply); });
   apply();
 })();
+
+var rcaEmailMode = 'normal';
+function rcaEmailTab(m){
+  rcaEmailMode = m;
+  ['short','normal','verbose'].forEach(function(x){
+    document.getElementById('email-'+x).style.display = (x===m) ? '' : 'none';
+  });
+  var btns = document.querySelectorAll('.emailbar button[data-mode]');
+  for (var i=0;i<btns.length;i++){ btns[i].className = (btns[i].getAttribute('data-mode')===m) ? 'active' : ''; }
+  document.getElementById('email-copied').textContent = '';
+}
+function rcaEmailCopy(){
+  var box = document.getElementById('email-'+rcaEmailMode);
+  var range = document.createRange();
+  range.selectNodeContents(box);
+  var sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+  var ok = false;
+  try { ok = document.execCommand('copy'); } catch(e) { ok = false; }
+  sel.removeAllRanges();
+  document.getElementById('email-copied').textContent = ok ? 'Copied! Paste into your email.' : 'Copy failed - select the text manually.';
+}
 </script>
 </body></html>
 "@
@@ -1105,6 +1154,195 @@ function New-JsonReport {
     $RcaResult | ConvertTo-Json -Depth 12 | Set-Content -Path $Path -Encoding UTF8
     Write-RcaLog "Wrote JSON report: $Path" -Level Info
     $Path
+}
+
+
+
+
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Private\Report\New-RcaNarrative.ps1:
+<#
+    Email-ready narrative generator. Turns an RcaResult into human-style prose that cites the
+    actual evidence ("at 1:58 AM, the SQL Server error log on W19B recorded ..."), in three
+    modes (Short / Normal / Verbose) and two renderings (Text / Html). The HTML rendering uses
+    simple tags (<p>/<b>/<ul>) that paste cleanly into Outlook with formatting intact.
+#>
+
+function Get-RcaSourcePhrase {
+    param([string]$Source)
+    switch ($Source) {
+        'ClusterLog'   { 'the Windows cluster log (cluster.log)' }
+        'WindowsEvent' { 'the Windows Event Log' }
+        'SqlErrorLog'  { 'the SQL Server error log' }
+        'SqlHaDmv'     { 'the Always On health views' }
+        'WsfcState'    { 'the cluster resource state' }
+        'NodeHealth'   { 'a node-health check' }
+        default        { "the $Source source" }
+    }
+}
+
+function Format-RcaClock {
+    param($Time, [switch]$Seconds)
+    try { $d = [datetime]$Time } catch { return "$Time" }
+    if ($Seconds) { $d.ToString('h:mm:ss tt') } else { $d.ToString('h:mm tt') }
+}
+function Format-RcaLongDate {
+    param($Time)
+    try { ([datetime]$Time).ToString('MMMM d, yyyy') } catch { "$Time" }
+}
+
+function ConvertTo-RcaEvidenceClause {
+    param($Event, [switch]$Seconds)
+    $t   = Format-RcaClock $Event.Timestamp -Seconds:$Seconds
+    $src = Get-RcaSourcePhrase $Event.Source
+    $msg = Get-RcaFirstLine ([string]$Event.Message) 150
+    "at $t, $src on $($Event.Node) recorded: ""$msg"""
+}
+
+function New-RcaNarrative {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$RcaResult,
+        [ValidateSet('Short', 'Normal', 'Verbose')][string]$Mode = 'Normal',
+        [ValidateSet('Text', 'Html')][string]$As = 'Text'
+    )
+
+    $primary  = $RcaResult.PrimaryFinding
+    $findings = @($RcaResult.Findings)
+    $timeline = @($RcaResult.Timeline)
+    $nodes    = @($RcaResult.Nodes)
+    $cluster  = $RcaResult.ClusterName
+    $ag       = $RcaResult.AvailabilityGroup
+    $et       = $RcaResult.EventTime
+
+    $scope = if ($ag) { "availability group '$ag'" }
+             elseif ($cluster) { "cluster '$cluster'" }
+             else { 'the SQL Server failover cluster' }
+    $nodeList = if ($nodes) { ($nodes -join ', ') } else { 'the cluster nodes' }
+
+    # Evidence to cite: the primary finding's triggering events, else notable timeline events.
+    $cite = if ($primary -and @($primary.Evidence).Count) { @($primary.Evidence) }
+            else { @($timeline | Where-Object { $_.Severity -in 'Critical', 'Error', 'Warning' }) }
+    $cite = @($cite | Sort-Object { try { [datetime]$_.Timestamp } catch { [datetime]::MaxValue } })
+
+    $conns = 'First', 'Then', 'Shortly afterward', 'Next', 'Following that', 'Subsequently', 'Finally'
+    function New-RcaSequence { param($Events, [int]$Max, [switch]$Seconds)
+        $pick = @($Events | Select-Object -First $Max)
+        $parts = for ($i = 0; $i -lt $pick.Count; $i++) {
+            $c = $conns[[Math]::Min($i, $conns.Count - 1)]
+            "$c $(ConvertTo-RcaEvidenceClause $pick[$i] -Seconds:$Seconds)."
+        }
+        $parts -join ' '
+    }
+
+    $blocks = [System.Collections.Generic.List[object]]::new()
+
+    if ($Mode -eq 'Short') {
+        if ($primary) {
+            $txt = "On $(Format-RcaLongDate $et), $scope on $nodeList failed over at approximately " +
+                   "$(Format-RcaClock $et). The most likely root cause is $($primary.Category.ToLower()) " +
+                   "(about $($primary.Confidence)% confidence). $($primary.Explanation) " +
+                   "Recommended next step: $($primary.Remediation)"
+        } else {
+            $txt = "On $(Format-RcaLongDate $et), a failover or role change on $scope around " +
+                   "$(Format-RcaClock $et) was analyzed across $($nodes.Count) node(s). The available " +
+                   "evidence did not point to a single clear fault; a correlated timeline of " +
+                   "$($timeline.Count) event(s) is available for review."
+        }
+        $blocks.Add(@{ t = 'p'; text = $txt })
+    }
+    elseif ($Mode -eq 'Normal') {
+        $plannedNote = if ($primary -and $primary.IsPlanned) { ' This appears to have been a planned or administrative action rather than a fault.' } else { '' }
+        $sum = if ($primary) {
+            "This is a root-cause summary for the SQL Server failover affecting $scope at " +
+            "$(Format-RcaClock $et) on $(Format-RcaLongDate $et). Across $($nodes.Count) node(s) " +
+            "($nodeList), the failover was most likely caused by $($primary.Category.ToLower()), " +
+            "with an estimated confidence of $($primary.Confidence)%.$plannedNote"
+        } else {
+            "This is a summary for the failover or role change on $scope around $(Format-RcaClock $et) " +
+            "on $(Format-RcaLongDate $et). No single fault root cause could be confirmed from the " +
+            "available evidence across $($nodes.Count) node(s)."
+        }
+        $blocks.Add(@{ t = 'p'; lead = 'Summary:'; text = $sum })
+
+        if ($cite.Count) {
+            $blocks.Add(@{ t = 'p'; lead = 'What the evidence shows:'; text = (New-RcaSequence -Events $cite -Max 4) })
+        }
+        if ($primary) {
+            $blocks.Add(@{ t = 'p'; lead = 'Root cause:'; text = $primary.Explanation })
+            $blocks.Add(@{ t = 'p'; lead = 'Recommended action:'; text = $primary.Remediation })
+            $others = @($findings | Where-Object { $_.RuleId -ne $primary.RuleId } | Select-Object -First 3 | ForEach-Object { $_.Category })
+            if ($others) { $blocks.Add(@{ t = 'p'; text = "Contributing or related factors also observed: $($others -join '; ')." }) }
+            if ($primary.KbRef) { $blocks.Add(@{ t = 'p'; text = "Reference: $($primary.KbRef)" }) }
+        }
+        $blocks.Add(@{ t = 'p'; text = 'The full RCA report, with the complete cross-node timeline and collection details, is available on request.' })
+    }
+    else {  # Verbose
+        $win = "$(Format-RcaClock $RcaResult.WindowStart -Seconds) to $(Format-RcaClock $RcaResult.WindowEnd -Seconds)"
+        $sum = if ($primary) {
+            "The following is a detailed root-cause analysis of the SQL Server failover affecting " +
+            "$scope$(if ($cluster -and $ag) { " (cluster '$cluster')" }). The event was centered on " +
+            "$(Format-RcaClock $et) on $(Format-RcaLongDate $et); evidence was correlated across the " +
+            "window $win on node(s) $nodeList. The analysis concludes the most probable root cause was " +
+            "$($primary.Category.ToLower()), rated at $($primary.Confidence)% confidence ($($primary.Severity))."
+        } else {
+            "The following is a detailed analysis of the failover or role change on $scope, centered on " +
+            "$(Format-RcaClock $et) on $(Format-RcaLongDate $et) and correlated across the window $win on " +
+            "node(s) $nodeList. No single fault root cause could be confirmed from the available evidence."
+        }
+        $blocks.Add(@{ t = 'p'; lead = 'Summary:'; text = $sum })
+
+        if ($cite.Count) {
+            $blocks.Add(@{ t = 'p'; lead = 'Sequence of events:'; text = (New-RcaSequence -Events $cite -Max 20 -Seconds) })
+        }
+        if ($primary) {
+            $blocks.Add(@{ t = 'p'; lead = 'Root cause:'; text = ("$($primary.Explanation) This conclusion is drawn from $(@($primary.Evidence).Count) corroborating signal(s).") })
+        }
+        if ($findings.Count) {
+            $blocks.Add(@{ t = 'p'; lead = 'All findings (ranked):' })
+            $blocks.Add(@{ t = 'ul'; items = @($findings | ForEach-Object {
+                "$($_.Category) - $($_.Severity), $($_.Confidence)%$(if ($_.IsPlanned) { ' (planned)' }): $($_.Explanation)" }) })
+        }
+        $rem = @($findings | ForEach-Object { $_.Remediation } | Where-Object { $_ } | Select-Object -Unique)
+        if ($rem) {
+            $blocks.Add(@{ t = 'p'; lead = 'Recommended actions:' })
+            $blocks.Add(@{ t = 'ul'; items = $rem })
+        }
+        $cs   = @($RcaResult.CollectionStatus)
+        $okN  = @($cs | Where-Object { $_.State -eq 'Ok' }).Count
+        $failN = @($cs | Where-Object { $_.State -eq 'Failed' }).Count
+        $blocks.Add(@{ t = 'p'; lead = 'Evidence coverage:'; text = "Collected $($timeline.Count) timeline event(s) from $($nodes.Count) node(s); $okN source(s) returned data and $failN could not be collected." })
+        $kb = @($findings | ForEach-Object { $_.KbRef } | Where-Object { $_ } | Select-Object -Unique)
+        if ($kb) {
+            $blocks.Add(@{ t = 'p'; lead = 'References:' })
+            $blocks.Add(@{ t = 'ul'; items = $kb })
+        }
+    }
+
+    # --- Render -------------------------------------------------------------
+    if ($As -eq 'Html') {
+        $sb = foreach ($b in $blocks) {
+            if ($b.t -eq 'ul') {
+                $li = ($b.items | ForEach-Object { "<li>$(ConvertTo-RcaHtmlEncoded $_)</li>" }) -join ''
+                "<ul>$li</ul>"
+            } else {
+                $lead = if ($b.ContainsKey('lead') -and $b.lead) { "<b>$(ConvertTo-RcaHtmlEncoded $b.lead)</b> " } else { '' }
+                $text = if ($b.ContainsKey('text') -and $b.text) { ConvertTo-RcaHtmlEncoded $b.text } else { '' }
+                "<p>$lead$text</p>"
+            }
+        }
+        ($sb -join "`r`n")
+    } else {
+        $sb = foreach ($b in $blocks) {
+            if ($b.t -eq 'ul') {
+                ($b.items | ForEach-Object { "  - $_" }) -join "`r`n"
+            } else {
+                $lead = if ($b.ContainsKey('lead') -and $b.lead) { "$($b.lead) " } else { '' }
+                $text = if ($b.ContainsKey('text') -and $b.text) { $b.text } else { '' }
+                ($lead + $text).TrimEnd()
+            }
+        }
+        ($sb -join "`r`n`r`n")
+    }
 }
 
 
@@ -1739,6 +1977,84 @@ function Export-FailoverReport {
 
 
 
+C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Public\Get-FailoverEmail.ps1:
+<#
+.SYNOPSIS
+  Produce an email-ready, human-style summary of an RcaResult (Short / Normal / Verbose),
+  optionally copying it to the clipboard with formatting preserved.
+.DESCRIPTION
+  Wraps the narrative generator. Returns the summary as plain text or as an HTML fragment.
+  With -ToClipboard it places a proper CF_HTML payload on the clipboard so pasting into
+  Outlook (or any rich editor) keeps the bold headings and bullets, plus a plain-text
+  fallback. Clipboard access needs an STA thread (the GUI and the PS 5.1 console are STA).
+.EXAMPLE
+  $r = Invoke-FailoverRCA -Node W19A,W19B -EventTime '2026-06-15 02:14'
+  Get-FailoverEmail -RcaResult $r -Mode Normal -ToClipboard
+#>
+function Get-FailoverEmail {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]$RcaResult,
+        [ValidateSet('Short', 'Normal', 'Verbose')][string]$Mode = 'Normal',
+        [ValidateSet('Text', 'Html')][string]$As = 'Text',
+        [switch]$ToClipboard
+    )
+    process {
+        $body = New-RcaNarrative -RcaResult $RcaResult -Mode $Mode -As $As
+
+        if ($ToClipboard) {
+            $html = if ($As -eq 'Html') { $body } else { New-RcaNarrative -RcaResult $RcaResult -Mode $Mode -As Html }
+            $text = if ($As -eq 'Text') { $body } else { New-RcaNarrative -RcaResult $RcaResult -Mode $Mode -As Text }
+            [void](Set-RcaClipboardHtml -Html $html -Text $text)
+        }
+        $body
+    }
+}
+
+# Build a CF_HTML clipboard payload (the Version/StartHTML/EndHTML/StartFragment/EndFragment
+# header with byte offsets) so Outlook recognizes it as formatted HTML.
+function ConvertTo-RcaCfHtml {
+    param([Parameter(Mandatory)][string]$Html)
+    $pre  = "Version:0.9`r`nStartHTML:{0:0000000000}`r`nEndHTML:{1:0000000000}`r`nStartFragment:{2:0000000000}`r`nEndFragment:{3:0000000000}`r`n"
+    $open = "<html><body><!--StartFragment-->"
+    $close = "<!--EndFragment--></body></html>"
+    $u = [System.Text.Encoding]::UTF8
+
+    $headerLen = $u.GetByteCount([string]::Format($pre, 0, 0, 0, 0))
+    $startHtml = $headerLen
+    $startFrag = $startHtml + $u.GetByteCount($open)
+    $endFrag   = $startFrag + $u.GetByteCount($Html)
+    $endHtml   = $endFrag + $u.GetByteCount($close)
+
+    [string]::Format($pre, $startHtml, $endHtml, $startFrag, $endFrag) + $open + $Html + $close
+}
+
+function Set-RcaClipboardHtml {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)][string]$Html, [string]$Text)
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+            Write-RcaLog 'Clipboard copy needs an STA thread; skipping (run from the GUI or an STA console).' -Level Warn
+            return $false
+        }
+        $cf = ConvertTo-RcaCfHtml -Html $Html
+        $do = New-Object System.Windows.Forms.DataObject
+        $do.SetText($cf, [System.Windows.Forms.TextDataFormat]::Html)
+        if ($Text) { $do.SetText($Text, [System.Windows.Forms.TextDataFormat]::UnicodeText) }
+        [System.Windows.Forms.Clipboard]::SetDataObject($do, $true)
+        return $true
+    }
+    catch {
+        Write-RcaLog "Clipboard copy failed: $($_.Exception.Message)" -Level Warn
+        return $false
+    }
+}
+
+
+
+
 C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Public\Get-FailoverEvidence.ps1:
 <#
 .SYNOPSIS
@@ -1944,6 +2260,11 @@ function Invoke-FailoverRCA {
         $reportParams = @{ RcaResult = $result; OutputPath = $runDir; Format = 'Both' }
         if ($OpenReport) { $reportParams.OpenReport = $true }
         Export-FailoverReport @reportParams | Out-Null
+
+        # Drop a plain-text, email-ready summary alongside the report for quick paste.
+        try { New-RcaNarrative -RcaResult $result -Mode Normal -As Text |
+                Set-Content -Path (Join-Path $runDir 'email-summary.txt') -Encoding UTF8 }
+        catch { Write-RcaLog "Could not write email-summary.txt: $($_.Exception.Message)" -Level Warn }
     }
 
     Write-RcaLog "=== Done. Findings: $($findings.Count). Output: $runDir ===" -Level Info
@@ -2078,6 +2399,13 @@ C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Samples\sample-report.htm
   .filters input,.filters select{padding:5px 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:13px}
   .filters input{flex:1;min-width:180px}
   .count{font-size:12px;color:#64748b;margin-left:auto}
+  .emailbar{display:flex;gap:6px;align-items:center;margin-bottom:10px}
+  .emailbar button{padding:5px 12px;border:1px solid #cbd5e1;background:#f8fafc;border-radius:4px;cursor:pointer;font-size:13px}
+  .emailbar button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .emailbar .copybtn{margin-left:auto;font-weight:600}
+  .emailbar .copied{color:#15803d;font-size:12px;font-weight:600}
+  .emailbox{border:1px solid #e2e8f0;border-radius:4px;padding:12px 16px;background:#fff;line-height:1.55}
+  .emailbox p{margin:0 0 10px} .emailbox ul{margin:0 0 10px;padding-left:20px} .emailbox li{margin:2px 0}
 </style></head><body>
 <header>
   <h1>SQL Server Failover - Root-Cause Report</h1>
@@ -2121,6 +2449,35 @@ C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Samples\sample-report.htm
         <td>SQL reported I/O stalls (error 833 / &quot;I/O requests taking longer than 15s&quot;) and/or Windows logged disk resets/retries (Event 129/153). Stalled storage makes sp_server_diagnostics and the lease appear unhealthy, which can drive an AG/FCI failover.</td>
         <td>Correlate SQL 833 I/O stalls with disk Event 129/153 and storage path latency; engage the storage team and check HBA/multipath/firmware. <a href="https://learn.microsoft.com/sql/relational-databases/errors-events/mssqlserver-833-database-engine-error">KB</a></td>
       </tr></tbody></table>
+  </section>
+
+  <section><h2>Email-ready summary</h2>
+    <div class="emailbar">
+      <button data-mode="short" onclick="rcaEmailTab('short')">Short</button>
+      <button data-mode="normal" class="active" onclick="rcaEmailTab('normal')">Normal</button>
+      <button data-mode="verbose" onclick="rcaEmailTab('verbose')">Verbose</button>
+      <button class="copybtn" onclick="rcaEmailCopy()">Copy to clipboard</button>
+      <span id="email-copied" class="copied"></span>
+    </div>
+    <div id="email-short" class="emailbox" style="display:none"><p>On June 15, 2026, availability group &#39;AG_OLTP&#39; on W16, W19B failed over at approximately 2:14 AM. The most likely root cause is ag lease / health timeout (about 94% confidence). The AG lease expired or the health check timed out (SQL 19407/19421, or ERRORLOG lease / sp_server_diagnostics entries). The resource DLL stopped getting a healthy response from the primary instance within LeaseTimeout/HealthCheckTimeout and failed the AG over. Recommended next step: Review HealthCheckTimeout/LeaseTimeout and FailureConditionLevel; investigate why sp_server_diagnostics stalled (CPU starvation, dump, non-yielding scheduler) on the primary.</p></div>
+    <div id="email-normal" class="emailbox"><p><b>Summary:</b> This is a root-cause summary for the SQL Server failover affecting availability group &#39;AG_OLTP&#39; at 2:14 AM on June 15, 2026. Across 2 node(s) (W16, W19B), the failover was most likely caused by ag lease / health timeout, with an estimated confidence of 94%.</p>
+<p><b>What the evidence shows:</b> First at 2:13 AM, the SQL Server error log on W19B recorded: &quot;The lease between availability group AG_OLTP and the Windows Server Failover Cluster has expired.&quot;. Then at 2:13 AM, the SQL Server error log on W19B recorded: &quot;Availability group health check timeout: sp_server_diagnostics did not return within HealthCheckTimeout.&quot;. Shortly afterward at 2:13 AM, the Windows cluster log (cluster.log) on W19B recorded: &quot;[RES] SQL Server Availability Group &lt;AG_OLTP&gt;: lease renewal failed; resource is failing.&quot;.</p>
+<p><b>Root cause:</b> The AG lease expired or the health check timed out (SQL 19407/19421, or ERRORLOG lease / sp_server_diagnostics entries). The resource DLL stopped getting a healthy response from the primary instance within LeaseTimeout/HealthCheckTimeout and failed the AG over.</p>
+<p><b>Recommended action:</b> Review HealthCheckTimeout/LeaseTimeout and FailureConditionLevel; investigate why sp_server_diagnostics stalled (CPU starvation, dump, non-yielding scheduler) on the primary.</p>
+<p>Contributing or related factors also observed: Cluster resource / RHS failure; Storage / I/O.</p>
+<p>Reference: https://learn.microsoft.com/sql/database-engine/availability-groups/windows/availability-group-lease-healthcheck-timeout</p>
+<p>The full RCA report, with the complete cross-node timeline and collection details, is available on request.</p></div>
+    <div id="email-verbose" class="emailbox" style="display:none"><p><b>Summary:</b> The following is a detailed root-cause analysis of the SQL Server failover affecting availability group &#39;AG_OLTP&#39; (cluster &#39;SQLCLU01&#39;). The event was centered on 2:14 AM on June 15, 2026; evidence was correlated across the window 1:44:00 AM to 2:29:00 AM on node(s) W16, W19B. The analysis concludes the most probable root cause was ag lease / health timeout, rated at 94% confidence (High).</p>
+<p><b>Sequence of events:</b> First at 2:13:48 AM, the SQL Server error log on W19B recorded: &quot;The lease between availability group AG_OLTP and the Windows Server Failover Cluster has expired.&quot;. Then at 2:13:52 AM, the SQL Server error log on W19B recorded: &quot;Availability group health check timeout: sp_server_diagnostics did not return within HealthCheckTimeout.&quot;. Shortly afterward at 2:13:58 AM, the Windows cluster log (cluster.log) on W19B recorded: &quot;[RES] SQL Server Availability Group &lt;AG_OLTP&gt;: lease renewal failed; resource is failing.&quot;.</p>
+<p><b>Root cause:</b> The AG lease expired or the health check timed out (SQL 19407/19421, or ERRORLOG lease / sp_server_diagnostics entries). The resource DLL stopped getting a healthy response from the primary instance within LeaseTimeout/HealthCheckTimeout and failed the AG over. This conclusion is drawn from 3 corroborating signal(s).</p>
+<p><b>All findings (ranked):</b> </p>
+<ul><li>AG lease / health timeout - High, 94%: The AG lease expired or the health check timed out (SQL 19407/19421, or ERRORLOG lease / sp_server_diagnostics entries). The resource DLL stopped getting a healthy response from the primary instance within LeaseTimeout/HealthCheckTimeout and failed the AG over.</li><li>Cluster resource / RHS failure - High, 78%: A clustered resource failed (Event 1069) or the Resource Hosting Subsystem terminated (Event 1146), or cluster.log shows an RHS/IsAlive failure. The group failed over because a resource in it could not stay online on the current owner.</li><li>Storage / I/O - High, 76%: SQL reported I/O stalls (error 833 / &quot;I/O requests taking longer than 15s&quot;) and/or Windows logged disk resets/retries (Event 129/153). Stalled storage makes sp_server_diagnostics and the lease appear unhealthy, which can drive an AG/FCI failover.</li></ul>
+<p><b>Recommended actions:</b> </p>
+<ul><li>Review HealthCheckTimeout/LeaseTimeout and FailureConditionLevel; investigate why sp_server_diagnostics stalled (CPU starvation, dump, non-yielding scheduler) on the primary.</li><li>A clustered resource failed its health check or the RHS hosting process terminated (Event 1069/1146). Identify the failing resource/DLL, review its IsAlive/LooksAlive and pending timeouts, and isolate it to its own RHS if it is crashing the monitor.</li><li>Correlate SQL 833 I/O stalls with disk Event 129/153 and storage path latency; engage the storage team and check HBA/multipath/firmware.</li></ul>
+<p><b>Evidence coverage:</b> Collected 11 timeline event(s) from 2 node(s); 12 source(s) returned data and 0 could not be collected.</p>
+<p><b>References:</b> </p>
+<ul><li>https://learn.microsoft.com/sql/database-engine/availability-groups/windows/availability-group-lease-healthcheck-timeout</li><li>https://learn.microsoft.com/windows-server/failover-clustering/troubleshooting-cluster-resource-failures</li><li>https://learn.microsoft.com/sql/relational-databases/errors-events/mssqlserver-833-database-engine-error</li></ul></div>
+    <p class="muted" style="margin-top:8px">Tip: pick a length, click Copy, then paste into Outlook - the formatting is preserved.</p>
   </section>
 
   <section><h2>Timeline <span class="muted">(11 events)</span></h2>
@@ -2235,82 +2592,82 @@ C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Samples\sample-report.htm
         <td>W16</td>
         <td>WsfcState</td>
         <td class="state-ok">Ok</td>
-        <td>21</td>
+        <td>25</td>
         <td>collected</td>
       </tr>
       <tr>
         <td>W16</td>
         <td>WindowsEvent</td>
         <td class="state-ok">Ok</td>
-        <td>55</td>
+        <td>24</td>
         <td>collected</td>
       </tr>
       <tr>
         <td>W16</td>
         <td>SqlErrorLog</td>
         <td class="state-ok">Ok</td>
-        <td>58</td>
+        <td>45</td>
         <td>collected</td>
       </tr>
       <tr>
         <td>W16</td>
         <td>SqlHaDmv</td>
         <td class="state-ok">Ok</td>
-        <td>41</td>
+        <td>47</td>
         <td>collected</td>
       </tr>
       <tr>
         <td>W16</td>
         <td>NodeHealth</td>
         <td class="state-ok">Ok</td>
-        <td>25</td>
+        <td>30</td>
         <td>collected</td>
       </tr>
       <tr>
         <td>W19B</td>
         <td>ClusterLog</td>
         <td class="state-ok">Ok</td>
-        <td>18</td>
+        <td>35</td>
         <td>collected</td>
       </tr>
       <tr>
         <td>W19B</td>
         <td>WsfcState</td>
         <td class="state-ok">Ok</td>
-        <td>6</td>
+        <td>26</td>
         <td>collected</td>
       </tr>
       <tr>
         <td>W19B</td>
         <td>WindowsEvent</td>
         <td class="state-ok">Ok</td>
-        <td>29</td>
+        <td>5</td>
         <td>collected</td>
       </tr>
       <tr>
         <td>W19B</td>
         <td>SqlErrorLog</td>
         <td class="state-ok">Ok</td>
-        <td>13</td>
+        <td>7</td>
         <td>collected</td>
       </tr>
       <tr>
         <td>W19B</td>
         <td>SqlHaDmv</td>
         <td class="state-ok">Ok</td>
-        <td>33</td>
+        <td>42</td>
         <td>collected</td>
       </tr>
       <tr>
         <td>W19B</td>
         <td>NodeHealth</td>
         <td class="state-ok">Ok</td>
-        <td>38</td>
+        <td>32</td>
         <td>collected</td>
       </tr></tbody></table>
   </section>
 
-  <p class="muted">Generated 2026-06-18 13:06:03 +10:00 by SqlFailoverClusterRCA.</p>
+  <p class="muted">Generated 2026-06-21 00:20:43 +10:00 by SqlFailoverClusterRCA.</p>
 </main>
 <script>
 (function(){
@@ -2337,6 +2694,29 @@ C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\Samples\sample-report.htm
   [q,fs,fv,fn].forEach(function(el){ el.addEventListener('input', apply); el.addEventListener('change', apply); });
   apply();
 })();
+
+var rcaEmailMode = 'normal';
+function rcaEmailTab(m){
+  rcaEmailMode = m;
+  ['short','normal','verbose'].forEach(function(x){
+    document.getElementById('email-'+x).style.display = (x===m) ? '' : 'none';
+  });
+  var btns = document.querySelectorAll('.emailbar button[data-mode]');
+  for (var i=0;i<btns.length;i++){ btns[i].className = (btns[i].getAttribute('data-mode')===m) ? 'active' : ''; }
+  document.getElementById('email-copied').textContent = '';
+}
+function rcaEmailCopy(){
+  var box = document.getElementById('email-'+rcaEmailMode);
+  var range = document.createRange();
+  range.selectNodeContents(box);
+  var sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+  var ok = false;
+  try { ok = document.execCommand('copy'); } catch(e) { ok = false; }
+  sel.removeAllRanges();
+  document.getElementById('email-copied').textContent = ok ? 'Copied! Paste into your email.' : 'Copy failed - select the text manually.';
+}
 </script>
 </body></html>
 
@@ -2379,6 +2759,10 @@ if (-not (Test-Path $script:ModuleManifest)) {
     [System.Windows.MessageBox]::Show("Cannot find SqlFailoverClusterRCA.psd1 next to this script.", 'SQL Failover RCA', 'OK', 'Error') | Out-Null
     return
 }
+
+# Import into the GUI session too, so the Copy-for-email button can call Get-FailoverEmail
+# directly on the result returned by the background runspace.
+Import-Module $script:ModuleManifest -Force -ErrorAction SilentlyContinue
 
 # --- UI definition --------------------------------------------------------------------------
 $xaml = @'
@@ -2445,9 +2829,19 @@ $xaml = @'
       </StackPanel>
     </Border>
 
-    <StackPanel Grid.Row="10" Orientation="Horizontal" HorizontalAlignment="Right">
-      <Button x:Name="btnOpenFolder" Content="Open output folder" Width="150" Height="28" IsEnabled="False"/>
-    </StackPanel>
+    <DockPanel Grid.Row="10" LastChildFill="False">
+      <StackPanel Orientation="Horizontal" DockPanel.Dock="Left">
+        <TextBlock Text="Copy email:" VerticalAlignment="Center" Margin="0,0,6,0"/>
+        <ComboBox x:Name="cmbEmail" Width="100" SelectedIndex="1">
+          <ComboBoxItem>Short</ComboBoxItem>
+          <ComboBoxItem>Normal</ComboBoxItem>
+          <ComboBoxItem>Verbose</ComboBoxItem>
+        </ComboBox>
+        <Button x:Name="btnCopyEmail" Content="Copy" Width="70" Height="28" Margin="6,0,0,0" IsEnabled="False"/>
+        <TextBlock x:Name="txtCopied" Foreground="Green" VerticalAlignment="Center" Margin="8,0,0,0"/>
+      </StackPanel>
+      <Button x:Name="btnOpenFolder" Content="Open output folder" Width="150" Height="28" IsEnabled="False" DockPanel.Dock="Right"/>
+    </DockPanel>
   </Grid>
 </Window>
 '@
@@ -2457,7 +2851,7 @@ $win = [System.Windows.Markup.XamlReader]::Load($reader)
 
 # Resolve controls.
 $ctl = @{}
-foreach ($n in 'rbNode','rbCluster','txtTarget','txtSql','chkAuto','dpDate','txtTime','txtBefore','txtAfter','txtOut','btnBrowse','chkCred','chkOpen','btnRun','pb','txtStatus','txtVerdict','txtFindings','btnOpenFolder') {
+foreach ($n in 'rbNode','rbCluster','txtTarget','txtSql','chkAuto','dpDate','txtTime','txtBefore','txtAfter','txtOut','btnBrowse','chkCred','chkOpen','btnRun','pb','txtStatus','txtVerdict','txtFindings','btnOpenFolder','cmbEmail','btnCopyEmail','txtCopied') {
     $ctl[$n] = $win.FindName($n)
 }
 
@@ -2470,6 +2864,7 @@ $script:psInst = $null
 $script:async  = $null
 $script:timer  = $null
 $script:lastDir = $null
+$script:lastResult = $null
 
 # --- Helpers --------------------------------------------------------------------------------
 function Set-RunningState {
@@ -2495,6 +2890,19 @@ $ctl.btnBrowse.Add_Click({
 
 $ctl.btnOpenFolder.Add_Click({
     if ($script:lastDir -and (Test-Path $script:lastDir)) { Invoke-Item $script:lastDir }
+}.GetNewClosure())
+
+$ctl.btnCopyEmail.Add_Click({
+    if (-not $script:lastResult) { return }
+    $mode = if ($ctl.cmbEmail.SelectedItem) { "$($ctl.cmbEmail.SelectedItem.Content)" } else { 'Normal' }
+    try {
+        Get-FailoverEmail -RcaResult $script:lastResult -Mode $mode -As Html -ToClipboard | Out-Null
+        $ctl.txtCopied.Text = "Copied ($mode) - paste into your email."
+    }
+    catch {
+        $ctl.txtCopied.Foreground = [System.Windows.Media.Brushes]::Firebrick
+        $ctl.txtCopied.Text = 'Copy failed.'
+    }
 }.GetNewClosure())
 
 $ctl.btnRun.Add_Click({
@@ -2562,7 +2970,10 @@ $ctl.btnRun.Add_Click({
         if (-not $script:async.IsCompleted) { return }
         $script:timer.Stop()
         $result = $null; $err = $null
-        try { $result = @($script:psInst.EndInvoke($script:async)) | Select-Object -Last 1 }
+        try {
+            $out = $script:psInst.EndInvoke($script:async)
+            if ($out.Count) { $result = $out[$out.Count - 1] }
+        }
         catch { $err = $_.Exception.Message }
         finally { $script:psInst.Dispose() }
 
@@ -2574,8 +2985,11 @@ $ctl.btnRun.Add_Click({
             return
         }
 
+        $script:lastResult = $result
         $script:lastDir = $result.EvidencePath
         $ctl.btnOpenFolder.IsEnabled = [bool]($script:lastDir -and (Test-Path $script:lastDir))
+        $ctl.btnCopyEmail.IsEnabled = ($null -ne $result)
+        $ctl.txtCopied.Text = ''
         $ctl.txtStatus.Text = "Done. $(@($result.Findings).Count) finding(s)."
 
         $pf = $result.PrimaryFinding
@@ -2631,7 +3045,7 @@ exit /b
 C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\SqlFailoverClusterRCA.psd1:
 @{
     RootModule        = 'SqlFailoverClusterRCA.psm1'
-    ModuleVersion     = '0.3.0'
+    ModuleVersion     = '0.4.0'
     GUID              = 'b6f2a4d1-3c8e-4a91-9f7d-2e5c1a8b4f30'
     Author            = 'Al Elmi'
     CompanyName       = 'Al Elmi'
@@ -2644,7 +3058,8 @@ C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\SqlFailoverClusterRCA.psd
         'Get-FailoverEvidence',
         'New-FailoverTimeline',
         'Get-FailoverRootCause',
-        'Export-FailoverReport'
+        'Export-FailoverReport',
+        'Get-FailoverEmail'
     )
     CmdletsToExport   = @()
     VariablesToExport = @()
@@ -2654,7 +3069,7 @@ C:\Users\alelm\OneDrive\Projects\SqlFailoverClusterRCA\SqlFailoverClusterRCA.psd
         PSData = @{
             Tags         = @('SQLServer', 'AlwaysOn', 'FCI', 'WSFC', 'FailoverCluster', 'RCA', 'DBA')
             ProjectUri   = ''
-            ReleaseNotes = 'Phase 1-4: real collectors (cluster.log, WSFC state, Windows events, SQL ERRORLOG, SQL HA DMVs, node health), throttled PSSessions with local in-process execution, direct-to-replica SQL over TDS, merged timeline, data-driven rules engine with confidence/severity ranking, and a self-contained HTML report (verdict + evidence chain, confidence bars, filterable color-coded timeline) plus JSON. Functional against live nodes; lab hardening continues in Phase 5.'
+            ReleaseNotes = 'Phase 1-4: real collectors (cluster.log, WSFC state, Windows events, SQL ERRORLOG, SQL HA DMVs, node health), throttled PSSessions with local in-process execution, direct-to-replica SQL over TDS, merged timeline, data-driven rules engine with confidence/severity ranking, and a self-contained HTML report (verdict + evidence chain, confidence bars, filterable color-coded timeline) plus JSON. v0.4.0 adds Get-FailoverEmail: human-style email-ready summaries (Short/Normal/Verbose) that cite the evidence, copyable to the clipboard with formatting preserved (CF_HTML), surfaced in the HTML report and the GUI. Functional against live nodes; lab hardening continues in Phase 5.'
         }
     }
 }
@@ -2732,8 +3147,8 @@ AfterAll {
 }
 
 Describe 'Module surface' {
-    It 'exports exactly the five public cmdlets' {
-        $expected = 'Invoke-FailoverRCA', 'Get-FailoverEvidence', 'New-FailoverTimeline', 'Get-FailoverRootCause', 'Export-FailoverReport'
+    It 'exports exactly the public cmdlets' {
+        $expected = 'Invoke-FailoverRCA', 'Get-FailoverEvidence', 'New-FailoverTimeline', 'Get-FailoverRootCause', 'Export-FailoverReport', 'Get-FailoverEmail'
         $actual = (Get-Command -Module SqlFailoverClusterRCA -CommandType Function).Name
         ($actual | Sort-Object) | Should -Be ($expected | Sort-Object)
     }
@@ -2818,6 +3233,43 @@ Describe 'Rule engine (real catalog rules)' {
         $tl = @(New-Tl 'ClusterLog' 'Info' $null 'Move-ClusterGroup initiated by administrator')
         $f = Get-FailoverRootCause -Timeline $tl
         ($f | Where-Object { $_.RuleId -eq 'PLANNED-MOVE' }).IsPlanned | Should -BeTrue
+    }
+}
+
+Describe 'Email narrative' {
+    BeforeAll {
+        $script:rcaForEmail = & (Get-Module SqlFailoverClusterRCA) {
+            $base = [datetime]'2026-06-15 01:58:00'
+            $tl = @(
+                New-TimelineEvent -Timestamp $base -Node 'W19B' -Source 'SqlErrorLog' -Severity 'Error' -EventId '19421' -Message 'Availability group health check timeout.'
+                New-TimelineEvent -Timestamp $base.AddSeconds(20) -Node 'W19B' -Source 'ClusterLog' -Severity 'Error' -Message 'lease renewal failed; resource failing.'
+            )
+            $f = @(Get-FailoverRootCause -Timeline $tl)
+            $res = New-RcaResult -ClusterName 'C1' -Nodes @('W16', 'W19B') -AvailabilityGroup 'AG1' `
+                -EventTime $base -WindowStart $base.AddMinutes(-30) -WindowEnd $base.AddMinutes(15) -Timeline $tl -Findings $f
+            $res.PrimaryFinding = $f | Where-Object { -not $_.IsPlanned } | Select-Object -First 1
+            $res
+        }
+    }
+
+    It 'produces non-empty text for all three modes' {
+        foreach ($m in 'Short', 'Normal', 'Verbose') {
+            (Get-FailoverEmail -RcaResult $script:rcaForEmail -Mode $m -As Text) | Should -Not -BeNullOrEmpty
+        }
+    }
+    It 'cites a clock time and a named source in the normal narrative' {
+        $n = Get-FailoverEmail -RcaResult $script:rcaForEmail -Mode Normal -As Text
+        $n | Should -Match '\d{1,2}:\d{2}'
+        $n | Should -Match 'SQL Server error log|cluster log'
+    }
+    It 'text mode has no HTML tags; html mode does' {
+        (Get-FailoverEmail -RcaResult $script:rcaForEmail -Mode Normal -As Text) | Should -Not -Match '<p>'
+        (Get-FailoverEmail -RcaResult $script:rcaForEmail -Mode Normal -As Html) | Should -Match '<p>'
+    }
+    It 'verbose is longer than short' {
+        $v = Get-FailoverEmail -RcaResult $script:rcaForEmail -Mode Verbose -As Text
+        $s = Get-FailoverEmail -RcaResult $script:rcaForEmail -Mode Short -As Text
+        $v.Length | Should -BeGreaterThan $s.Length
     }
 }
 
